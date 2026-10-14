@@ -2,7 +2,7 @@ name: BingX market monitor
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '2,32 * * * *' # Infrequent backup; external cron-job.org dispatches every 5m.
   workflow_dispatch:
 
 permissions:
