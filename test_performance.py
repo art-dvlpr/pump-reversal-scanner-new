@@ -5,8 +5,10 @@ from __future__ import annotations
 import unittest
 
 from monitor import Bar, FIVE_MINUTES
-from performance import (advance_evaluations, apply_bar, outcome,
-                         prepare_milestone_report, record_alert, summarize)
+from performance import (DIGEST_INTERVAL_MS, advance_evaluations, apply_bar,
+                         mark_digest_sent, outcome, prepare_digest,
+                         prepare_milestone_report, record_alert,
+                         recurring_patterns, render_digest, summarize)
 
 
 class FakeBingX:
@@ -96,6 +98,57 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(state["next_report_at"], 200)
         self.assertIsNone(prepare_milestone_report(state, self.sent + 25 * 3_600_000))
         self.assertEqual(summarize(records)["overall"]["n"], 100)
+
+    def test_three_day_digest_counts_outcomes_and_waits_for_telegram(self):
+        state = {"evaluations": [], "completed_total": 0, "data_gap_total": 0}
+        start = 1_800_000_000_000
+        self.assertIsNone(prepare_digest(state, start))
+        record = record_alert(self.short, {}, start + FIVE_MINUTES, "v1")
+        record["status"] = "complete"
+        record["completed_at_ms"] = start + 30 * 3_600_000
+        record["first_tp_ms"][0] = record["first_full_bar_ms"]
+        state["evaluations"] = [record]
+        state["completed_total"] = 1
+        state["data_gap_total"] = 1
+        self.assertIsNone(prepare_digest(state, start + DIGEST_INTERVAL_MS - 1))
+        due = start + DIGEST_INTERVAL_MS
+        report = prepare_digest(state, due)
+        self.assertEqual(report["complete_total"], 1)
+        self.assertEqual(report["summary"]["by_side"]["short"]["tp_first"], 1)
+        self.assertEqual(report["data_gaps"], 1)
+        self.assertIn("TP1→SL: 1", render_digest(report))
+        # Preparation alone must not suppress a retry after Telegram failure.
+        self.assertEqual(prepare_digest(state, due)["complete_total"], 1)
+        mark_digest_sent(state, report, 123)
+        self.assertIsNone(prepare_digest(state, due + FIVE_MINUTES))
+        self.assertEqual(state["digest_history"][-1]["message_id"], 123)
+
+    def test_no_pattern_claim_on_small_sample(self):
+        record = record_alert(self.short, {}, self.sent, "v1")
+        record["status"] = "complete"
+        record["completed_at_ms"] = record["end_ms"]
+        self.assertEqual(recurring_patterns([record] * 79), [])
+
+    def test_pattern_requires_same_direction_in_both_cohorts(self):
+        records = []
+        for index in range(80):
+            row = record_alert(self.short, {}, self.sent + index * FIVE_MINUTES, "v1")
+            row["status"] = "complete"
+            row["completed_at_ms"] = row["end_ms"]
+            high_pump = index % 40 < 20
+            row["features"]["pump_pct"] = 100 if high_pump else 20
+            if high_pump:
+                row["first_tp_ms"][0] = row["first_full_bar_ms"]
+            else:
+                row["first_sl_ms"] = row["first_full_bar_ms"]
+            records.append(row)
+        patterns = recurring_patterns(records)
+        self.assertTrue(any(item["feature"] == "pump_pct" and
+                            item["direction"] == "stronger" for item in patterns))
+        for row in records[40:]:
+            row["first_sl_ms"], row["first_tp_ms"][0] = (
+                row["first_tp_ms"][0], row["first_sl_ms"])
+        self.assertEqual(recurring_patterns(records), [])
 
 
 if __name__ == "__main__":

@@ -4,12 +4,24 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 from monitor import FIVE_MINUTES, Bar, closed_bars, number, utc
 
 HORIZON_MS = 24 * 3_600_000
 REPORT_EVERY = 100
 MAX_RECORDS = 300
+DIGEST_INTERVAL_MS = 3 * 24 * 3_600_000
+FACTOR_EDGES = {
+    "short": {"old_peak_multiple": (3, 10), "pump_pct": (40, 80),
+              "retrace_pct": (8, 15), "spread_pct": (0.1, 0.3)},
+    "long": {"oi_change_pct": (5, 10), "gain15_pct": (5, 10),
+             "volume_ratio": (3, 5), "spread_pct": (0.1, 0.3)},
+}
+FEATURE_LABELS = {"old_peak_multiple": "старый пик / цена",
+                  "pump_pct": "размер пампа", "retrace_pct": "откат от пика",
+                  "spread_pct": "спред", "oi_change_pct": "рост OI",
+                  "gain15_pct": "рост за 15 минут", "volume_ratio": "объём / обычный"}
 
 
 def record_alert(signal: dict, context: dict, sent_at_ms: int,
@@ -112,6 +124,7 @@ def advance_evaluations(client, state: dict, now_ms: int) -> dict:
                 if now_ms >= record["end_ms"] + 12 * 3_600_000:
                     record["status"] = "data_gap"
                     record["gap_at_ms"] = record["next_bar_ms"]
+                    record["finalized_at_ms"] = now_ms
                     gaps += 1
             continue
         for record in symbol_records:
@@ -124,6 +137,7 @@ def advance_evaluations(client, state: dict, now_ms: int) -> dict:
                 if bar.start_ms != expected:
                     record["status"] = "data_gap"
                     record["gap_at_ms"] = expected
+                    record["finalized_at_ms"] = now_ms
                     gaps += 1
                     break
                 apply_bar(record, bar)
@@ -137,6 +151,7 @@ def advance_evaluations(client, state: dict, now_ms: int) -> dict:
             elif now_ms >= expected + 2 * FIVE_MINUTES:
                 record["status"] = "data_gap"
                 record["gap_at_ms"] = expected
+                record["finalized_at_ms"] = now_ms
                 gaps += 1
     state["completed_total"] = state.get("completed_total", 0) + completed
     state["data_gap_total"] = state.get("data_gap_total", 0) + gaps
@@ -182,14 +197,8 @@ def summarize(records: list[dict]) -> dict:
                for side in ("short", "long")}
     by_version = {version: _counts([row for row in completed if row.get("strategy_version") == version])
                   for version in sorted({row.get("strategy_version", "unknown") for row in completed})}
-    definitions = {
-        "short": {"old_peak_multiple": (3, 10), "pump_pct": (40, 80),
-                  "retrace_pct": (8, 15), "spread_pct": (0.1, 0.3)},
-        "long": {"oi_change_pct": (5, 10), "gain15_pct": (5, 10),
-                 "volume_ratio": (3, 5), "spread_pct": (0.1, 0.3)},
-    }
     factors = {}
-    for side, fields in definitions.items():
+    for side, fields in FACTOR_EDGES.items():
         for field, edges in fields.items():
             grouped: dict[str, list[dict]] = defaultdict(list)
             for row in completed:
@@ -202,6 +211,120 @@ def summarize(records: list[dict]) -> dict:
                                           for label, group in grouped.items() if len(group) >= 10}
     return {"sample_count": len(completed), "overall": _counts(completed),
             "by_side": by_side, "by_version": by_version, "factors": factors}
+
+
+def recurring_patterns(records: list[dict]) -> list[dict]:
+    """Flag stable associations in two disjoint forward cohorts, never tune on them."""
+    suggestions = []
+    for side, fields in FACTOR_EDGES.items():
+        side_rows = sorted((row for row in records if row.get("status") == "complete" and
+                            row.get("side") == side), key=lambda row: row["completed_at_ms"])
+        if not side_rows:
+            continue
+        version = side_rows[-1].get("strategy_version", "unknown")
+        side_rows = [row for row in side_rows if row.get("strategy_version", "unknown") == version]
+        if len(side_rows) < 80:
+            continue
+        midpoint = len(side_rows) // 2
+        cohorts = (side_rows[:midpoint], side_rows[midpoint:])
+        for field, edges in fields.items():
+            for bucket in (f"<{edges[0]}", f"{edges[0]}–{edges[1]}", f"≥{edges[1]}"):
+                deltas = []
+                sample_sizes = []
+                for cohort in cohorts:
+                    group = [row for row in cohort if
+                             _bucket(row.get("features", {}).get(field), edges) == bucket]
+                    others = [row for row in cohort if
+                              _bucket(row.get("features", {}).get(field), edges) not in (bucket, None)]
+                    if len(group) < 12 or len(others) < 12:
+                        break
+                    deltas.append((_counts(group)["tp_first"] / len(group) -
+                                   _counts(others)["tp_first"] / len(others)))
+                    sample_sizes.append(len(group))
+                if len(deltas) != 2 or not (all(delta >= 0.25 for delta in deltas) or
+                                            all(delta <= -0.25 for delta in deltas)):
+                    continue
+                suggestions.append({"side": side, "feature": field, "bucket": bucket,
+                                    "direction": "stronger" if deltas[0] > 0 else "weaker",
+                                    "group_n": sum(sample_sizes),
+                                    "min_tp_first_gap_pp": round(100 * min(map(abs, deltas)), 1),
+                                    "strategy_version": version})
+    return sorted(suggestions, key=lambda row: -row["min_tp_first_gap_pp"])
+
+
+def prepare_digest(state: dict, now_ms: int) -> dict | None:
+    """Prepare one rolling three-day Telegram digest; sending is handled separately."""
+    since_ms = state.get("digest_since_ms")
+    if not isinstance(since_ms, int) or since_ms <= 0:
+        state["digest_since_ms"] = now_ms
+        state["digest_completed_baseline"] = state.get("completed_total", 0)
+        state["digest_gap_baseline"] = state.get("data_gap_total", 0)
+        return None
+    if now_ms - since_ms < DIGEST_INTERVAL_MS:
+        return None
+    rows = state.get("evaluations", [])
+    complete = [row for row in rows if row.get("status") == "complete" and
+                since_ms <= row.get("completed_at_ms", 0) <= now_ms]
+    total_complete = max(0, state.get("completed_total", 0) -
+                         state.get("digest_completed_baseline", 0))
+    return {"since_ms": since_ms, "until_ms": now_ms,
+            "summary": summarize(complete),
+            "complete_total": total_complete,
+            "detail_complete": len(complete) == total_complete,
+            "data_gaps": max(0, state.get("data_gap_total", 0) -
+                             state.get("digest_gap_baseline", 0)),
+            "pending": sum(row.get("status") == "pending" for row in rows),
+            "patterns": recurring_patterns(rows)[:2]}
+
+
+def mark_digest_sent(state: dict, report: dict, message_id: int) -> None:
+    """Commit the new interval only after Telegram confirms acceptance."""
+    if report["since_ms"] != state.get("digest_since_ms"):
+        raise ValueError("Digest interval changed before send confirmation")
+    state["digest_since_ms"] = report["until_ms"]
+    state["digest_completed_baseline"] = state.get("completed_total", 0)
+    state["digest_gap_baseline"] = state.get("data_gap_total", 0)
+    state.setdefault("digest_history", []).append({
+        "sent_at_ms": report["until_ms"], "message_id": message_id,
+        "completed": report["complete_total"], "data_gaps": report["data_gaps"]})
+    state["digest_history"] = state["digest_history"][-10:]
+
+
+def render_digest(report: dict) -> str:
+    """Compact HTML for the same Telegram bot used by entry alerts."""
+    def msk(ms: int) -> str:
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).astimezone(
+            timezone(timedelta(hours=3))).strftime("%d.%m %H:%M")
+
+    summary = report["summary"]
+    lines = ["📊 <b>СВОДКА СИГНАЛОВ · BingX</b>",
+             f"🕒 {msk(report['since_ms'])} — {msk(report['until_ms'])} МСК",
+             "━━━━━━━━━━━━━━━━━━",
+             f"✅ Завершено за период: <b>{report['complete_total']}</b>"]
+    for side, label in (("short", "🔴 SHORT"), ("long", "🟢 LONG")):
+        row = summary["by_side"][side]
+        lines.append(f"{label}: {row['n']} · TP1→SL: {row['tp_first']} · "
+                     f"SL→TP1: {row['sl_first']} · в одной свече: {row['same_bar']} · "
+                     f"без касания: {row['neither']}")
+    lines.extend([f"⏳ Ещё проверяются: {report['pending']} · "
+                  f"⚠️ Пробелы данных: {report['data_gaps']}",
+                  "━━━━━━━━━━━━━━━━━━"])
+    if not report["detail_complete"]:
+        lines.append("⚠️ Часть старых деталей вышла из хранилища; разбивка неполная.")
+    if report["patterns"]:
+        for pattern in report["patterns"]:
+            label = "лучше" if pattern["direction"] == "stronger" else "хуже"
+            lines.append(f"🔎 Гипотеза: {pattern['side'].upper()} · "
+                         f"{FEATURE_LABELS[pattern['feature']]} {pattern['bucket']} — "
+                         f"TP1 раньше SL {label} в двух выборках "
+                         f"(n={pattern['group_n']}).")
+        lines.append("Правила входа по этой сводке автоматически не менялись: "
+                     "нужна проверка издержек и новых данных.")
+    else:
+        lines.append("🔎 Устойчивых повторяющихся признаков для пересмотра правил пока нет.")
+    lines.append("Исходы расчётных уровней за 24ч по свечам, не твои сделки и не PnL; "
+                 "без комиссий, funding и проскальзывания.")
+    return "\n".join(lines)
 
 
 def prepare_milestone_report(state: dict, now_ms: int) -> dict | None:

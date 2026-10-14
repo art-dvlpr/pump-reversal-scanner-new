@@ -14,7 +14,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from monitor import BingX, FIVE_MINUTES, number, scan_market, utc
-from performance import advance_evaluations, prepare_milestone_report, record_alert
+from performance import (advance_evaluations, mark_digest_sent, prepare_digest,
+                         prepare_milestone_report, record_alert, render_digest)
 from state_store import configured_store
 
 
@@ -358,8 +359,17 @@ def main() -> int:
                               if 0 <= pruning_ms - row.get("at_ms", 0) <= 24 * 3_600_000]
     evaluation = advance_evaluations(client, state, int(time.time() * 1000))
     report = prepare_milestone_report(state, int(time.time() * 1000))
+    digest = prepare_digest(state, int(time.time() * 1000))
+    if digest:
+        try:
+            digest_id = telegram_send(token, chat_id, render_digest(digest))
+            mark_digest_sent(state, digest, digest_id)
+            print(f"Telegram accepted three-day digest message_id={digest_id}")
+        except Exception as error:
+            failures.append(f"Three-day digest: {error}")
     print(json.dumps({"evaluation": evaluation,
-                      "report_ready": report["milestone"] if report else None},
+                      "report_ready": report["milestone"] if report else None,
+                      "digest_due": digest is not None},
                      ensure_ascii=False))
     # The latest ticker/OI snapshots make five-minute changes measurable.
     if json.dumps(state, sort_keys=True) != before:
