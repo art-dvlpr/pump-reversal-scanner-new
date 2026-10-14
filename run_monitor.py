@@ -200,6 +200,29 @@ def mark_sent(signal: dict, state: dict) -> None:
     episode[field] = True
 
 
+def daily_digest_due(state: dict, now_ms: int) -> tuple[bool, str]:
+    local = datetime.fromtimestamp(now_ms / 1000, timezone(timedelta(hours=3)))
+    day = local.strftime("%Y-%m-%d")
+    return local.hour >= 9 and state.get("last_digest_day") != day, day
+
+
+def daily_digest(state: dict, coverage: dict, now_ms: int) -> str:
+    recent = [row for row in state.get("alert_history", [])
+              if 0 <= now_ms - row.get("at_ms", 0) <= 24 * 3_600_000]
+    short = sum(row["side"] == "short" for row in recent)
+    long = sum(row["side"] == "long" for row in recent)
+    return ("<b>📋 BingX · отчёт за последние 24 часа</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🔴 Short-наблюдений/сценариев: {short}\n"
+            f"🟢 Long-наблюдений/сценариев: {long}\n"
+            f"🔎 Контрактов в последнем обзоре: {coverage['tradable_count']}; "
+            f"проверены свечи: {coverage['deep_count']}\n"
+            f"🕒 Последняя проверка: {datetime.fromtimestamp(now_ms / 1000, timezone(timedelta(hours=3))).strftime('%d.%m %H:%M МСК')}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            + ("Новых подтверждённых условий за сутки может не быть; входы не выдумываются."
+               if not recent else "Сценарии остаются условными; сделки только вручную."))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Read public markets, print; do not send or save")
@@ -247,9 +270,22 @@ def main() -> int:
             context = client.context(signal["symbol"]) if signal["actionable"] else None
             message_id = telegram_send(token, chat_id, message(signal, context))
             mark_sent(signal, state)
+            state.setdefault("alert_history", []).append({
+                "at_ms": now_ms,
+                "side": "long" if signal["stage"].startswith("momentum_") else "short"})
             print(f"Telegram accepted {signal['symbol']} {signal['stage']} message_id={message_id}")
         except Exception as error:
             failures.append(f"{signal['symbol']}: {error}")
+    state["alert_history"] = [row for row in state.get("alert_history", [])
+                              if 0 <= now_ms - row.get("at_ms", 0) <= 24 * 3_600_000]
+    due, day = daily_digest_due(state, now_ms)
+    if due:
+        try:
+            message_id = telegram_send(token, chat_id, daily_digest(state, coverage, now_ms))
+            state["last_digest_day"] = day
+            print(f"Telegram accepted daily digest message_id={message_id}")
+        except Exception as error:
+            failures.append(f"Daily digest: {error}")
     # The latest ticker/OI snapshots make five-minute changes measurable.
     if json.dumps(state, sort_keys=True) != before:
         store.save(state)

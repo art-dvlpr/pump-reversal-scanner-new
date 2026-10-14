@@ -6,8 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from monitor import Bar, Ticker, candidates, confirm_momentum, evaluate, evaluate_momentum, old_peak
-from run_monitor import episode_for, mark_sent, message, select_alerts
+from monitor import (Bar, Ticker, candidates, confirm_momentum, evaluate,
+                     evaluate_momentum, old_peak, updated_price_snapshots)
+from run_monitor import daily_digest, daily_digest_due, episode_for, mark_sent, message, select_alerts
 from state_store import LocalStateStore
 
 FIVE = 300_000
@@ -34,6 +35,16 @@ class MonitorTests(unittest.TestCase):
         tickers.append(Ticker("VELVET-USDT", 1, 1.01, 1, 200_000, 0.999, 1.001))
         chosen = candidates(tickers, {ticker.symbol for ticker in tickers})
         self.assertEqual(len(chosen), 41)
+
+    def test_gradual_hourly_move_below_eight_percent_is_deep_scanned(self):
+        ticker = Ticker("SLOW-USDT", 1.035, 1.04, 1, 800_000, 1.034, 1.036)
+        previous = {}
+        for minute, price in ((-60, 1), (-45, 1.008), (-30, 1.016),
+                              (-15, 1.025), (-5, 1.032)):
+            previous = updated_price_snapshots(
+                [Ticker(ticker.symbol, price, 1.04, 1, 800_000, 1.034, 1.036)],
+                {ticker.symbol}, previous, self.now + minute * 60_000)
+        self.assertIn(ticker, candidates([ticker], {ticker.symbol}, previous, self.now))
 
     def test_watch_then_closed_five_minute_breakdown(self):
         bars = sample_bars(self.now)
@@ -132,6 +143,17 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("🔴 #SHORT", rendered)
         self.assertIn("НАБЛЮДАЕМ", rendered)
         self.assertNotIn("TP1", rendered)
+
+    def test_daily_status_is_not_presented_as_a_trading_signal(self):
+        # Choose a known Moscow morning independently of test fixture clock.
+        from datetime import datetime, timezone
+        now = int(datetime(2027, 1, 1, 7, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        due, day = daily_digest_due({}, now)
+        self.assertTrue(due)
+        self.assertFalse(daily_digest_due({"last_digest_day": day}, now)[0])
+        report = daily_digest({}, {"tradable_count": 900, "deep_count": 200}, now)
+        self.assertIn("Новых подтверждённых условий за сутки может не быть", report)
+        self.assertNotIn("Точка входа", report)
 
 
 if __name__ == "__main__":

@@ -350,15 +350,48 @@ def confirm_momentum(signal: dict, current_oi: float, prior: dict | None,
 
 def candidates(tickers: list[Ticker], tradable: set[str],
                price_snapshots: dict | None = None, now_ms: int | None = None) -> list[Ticker]:
-    """No top-N cut; fresh 5m changes supplement the 24h range screen."""
+    """No top-N cut; observed 15m/1h changes supplement the range screen."""
     price_snapshots = price_snapshots or {}
     return [ticker for ticker in tickers if ticker.symbol in tradable and
             (ticker.range_pct >= 8 or ticker.symbol in PINNED or
-             (ticker.symbol in price_snapshots and
-              (now_ms is None or 0 <= now_ms - price_snapshots[ticker.symbol].get("at_ms", 0) <=
-               20 * 60_000) and
-              number(price_snapshots[ticker.symbol].get("price")) > 0 and
-              abs(ticker.price / number(price_snapshots[ticker.symbol]["price"]) - 1) >= 0.012))]
+             snapshot_movement(ticker, price_snapshots.get(ticker.symbol), now_ms))]
+
+
+def snapshot_movement(ticker: Ticker, snapshot: dict | None, now_ms: int | None) -> bool:
+    if not snapshot or now_ms is None:
+        return False
+    samples = snapshot.get("samples") or [snapshot]
+    recent = [row for row in samples if 0 <= now_ms - row.get("at_ms", 0) <= 65 * 60_000
+              and number(row.get("price")) > 0]
+    if not recent:
+        return False
+    # Fast moves and sustained low-range momentum are both candidates; the
+    # candle/OI evaluators still decide whether any alert is justified.
+    latest = max(recent, key=lambda row: row["at_ms"])
+    if now_ms - latest["at_ms"] <= 20 * 60_000 and abs(
+            ticker.price / number(latest["price"]) - 1) >= 0.012:
+        return True
+    for window, threshold, minimum in ((20, 0.018, 8), (65, 0.028, 35)):
+        eligible = [row for row in recent if minimum * 60_000 <= now_ms - row["at_ms"] <=
+                    window * 60_000]
+        if eligible and ticker.price / number(min(eligible, key=lambda row: row["at_ms"])["price"]) - 1 >= threshold:
+            return True
+    return False
+
+
+def updated_price_snapshots(tickers: list[Ticker], tradable: set[str],
+                            previous: dict, now_ms: int) -> dict:
+    updates = {}
+    for ticker in tickers:
+        if ticker.symbol not in tradable:
+            continue
+        old = previous.get(ticker.symbol, {})
+        samples = old.get("samples") or ([old] if old else [])
+        samples = [row for row in samples if 0 < now_ms - row.get("at_ms", 0) <=
+                   65 * 60_000 and number(row.get("price")) > 0]
+        samples.append({"price": ticker.price, "at_ms": now_ms})
+        updates[ticker.symbol] = {"samples": samples[-14:]}
+    return updates
 
 
 def scan_market(client: BingX, now_ms: int, history: dict,
@@ -424,8 +457,8 @@ def scan_market(client: BingX, now_ms: int, history: dict,
     return results, {"ticker_count": len(tickers), "tradable_count": len(tradable),
                      "deep_count": len(selected), "errors": errors,
                      "history_updates": historical_updates, "oi_updates": oi_updates,
-                     "price_updates": {ticker.symbol: {"price": ticker.price, "at_ms": now_ms}
-                                       for ticker in tickers if ticker.symbol in tradable}}
+                     "price_updates": updated_price_snapshots(
+                         tickers, tradable, price_snapshots or {}, now_ms)}
 
 
 def main() -> int:
