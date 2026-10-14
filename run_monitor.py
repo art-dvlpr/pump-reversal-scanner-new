@@ -13,7 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from monitor import BingX, scan_market
+from monitor import BingX, FIVE_MINUTES, number, scan_market, utc
 from state_store import configured_store
 
 
@@ -62,10 +62,11 @@ def episode_for(signal: dict, episodes: dict, now_ms: int) -> dict:
             prior = {"started_ms": now_ms, "confirmed_sent": False}
             episodes[symbol] = prior
         return prior
-    if (not prior or
-            (signal["peak_ms"] > prior.get("peak_ms", 0) and
-             (signal["peak"] >= prior.get("anchor_peak", 0) * 1.15 or
-              now_ms - prior.get("started_ms", 0) >= 24 * 3_600_000))):
+    new_cycle = (prior and prior.get("reversal_sent") and
+                 signal["peak_ms"] > prior.get("sent_event_ms", prior.get("peak_ms", 0)) and
+                 now_ms - prior.get("sent_at_ms", prior.get("started_ms", 0)) >= 2 * 3_600_000 and
+                 signal.get("rebound3h_pct", 0) >= 20)
+    if not prior or new_cycle:
         prior = {"started_ms": now_ms, "peak_ms": signal["peak_ms"],
                  "anchor_peak": signal["peak"], "reversal_sent": False}
         episodes[symbol] = prior
@@ -111,10 +112,10 @@ def message(signal: dict, context: dict | None = None) -> str:
              f"🕒 {local_time(signal['last_closed_utc'])} · закрытая 5м свеча",
              f"📍 <b>{status}</b>",
              "━━━━━━━━━━━━━━━━━━",
-             f"💵 Текущая цена: <b>{price(signal['price'])} USDT</b>"]
+             f"💵 Цена: <b>{price(signal['price'])} USDT</b> · {local_time(signal['observed_utc'])}"]
     if momentum:
         lines.extend([f"📈 Рост: +{signal['gain15_pct']}% / 15м; +{signal['gain60_pct']}% / 1ч",
-                      f"📊 Объём 5м: {signal['volume_ratio']}× обычного",
+                      f"📊 Объём 15м: {signal['volume_ratio']}× обычного",
                       f"🧲 OI: {signal['oi_change_pct']:+.2f}% за {signal['oi_window_min']}м" if
                       signal.get("oi_change_pct") is not None else
                       "🧲 OI: ждём второго замера"])
@@ -140,6 +141,8 @@ def message(signal: dict, context: dict | None = None) -> str:
                   "Размер позиции рассчитай вручную; ориентир — риск до 2% капитала."])
     lines.extend(["━━━━━━━━━━━━━━━━━━",
                   f"💧 Оборот 24ч: {signal['turnover_usdt']:,} USDT · спред: {signal['spread_pct']}%"])
+    if signal.get("book_slippage_pct") is not None:
+        lines.append(f"📚 Стакан: оценка исполнения 1 000 USDT — {signal['book_slippage_pct']:.3f}%")
     if context:
         oi = context.get("open_interest") or {}
         if not momentum and oi.get("openInterest"):
@@ -178,6 +181,90 @@ def mark_sent(signal: dict, state: dict) -> None:
     episode = state["episodes"][key]
     field = "confirmed_sent" if momentum else "reversal_sent"
     episode[field] = True
+    if not momentum:
+        episode["sent_event_ms"] = signal["event_ms"]
+        episode["sent_at_ms"] = signal["event_ms"] + FIVE_MINUTES
+
+
+def book_slippage_pct(book: dict, side: str, reference_price: float,
+                      notional_usdt: float = 1_000) -> float:
+    """Estimate immediate $1,000 execution cost from visible book levels."""
+    levels = book.get("asks" if side == "long" else "bids") or []
+    remaining = notional_usdt / reference_price
+    filled_quote = 0.0
+    for raw_price, raw_qty in levels:
+        price, qty = float(raw_price), float(raw_qty)
+        if price <= 0 or qty <= 0:
+            continue
+        taken = min(remaining, qty)
+        filled_quote += taken * price
+        remaining -= taken
+        if remaining <= 1e-9:
+            break
+    if remaining > 1e-9:
+        raise ValueError("Order book too thin for $1,000 reference order")
+    average = filled_quote / (notional_usdt / reference_price)
+    return 100 * (average / reference_price - 1) if side == "long" else \
+        100 * (1 - average / reference_price)
+
+
+def refresh_entry(signal: dict, ticker, book: dict, now_ms: int) -> dict:
+    """Fail closed if a closed-candle setup is no longer executable."""
+    if not signal.get("actionable"):
+        raise ValueError("entry conditions absent")
+    age_limit = 20 * 60_000 if signal["stage"] == "momentum_confirmed" else 25 * 60_000
+    if not 0 <= now_ms - signal["event_ms"] <= age_limit:
+        raise ValueError("entry event expired")
+    if not ticker.at_ms or abs(now_ms - ticker.at_ms) > 120_000:
+        raise ValueError("ticker stale")
+    book_at = int(book.get("T") or 0)
+    if not book_at or abs(now_ms - book_at) > 30_000:
+        raise ValueError("order book stale")
+    bids, asks = book.get("bids") or [], book.get("asks") or []
+    if not bids or not asks:
+        raise ValueError("order book empty")
+    best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
+    if best_bid <= 0 or best_ask <= best_bid:
+        raise ValueError("order book crossed or invalid")
+    if abs(best_bid / ticker.bid - 1) > 0.01 or abs(best_ask / ticker.ask - 1) > 0.01:
+        raise ValueError("ticker and order book disagree")
+    spread = 100 * (best_ask / best_bid - 1)
+    side = "long" if signal["stage"] == "momentum_confirmed" else "short"
+    limit = 0.4 if side == "long" else 0.5
+    if ticker.turnover_usdt < (1_000_000 if side == "long" else 300_000):
+        raise ValueError("24h turnover below entry threshold")
+    if spread > limit:
+        raise ValueError("spread above entry threshold")
+    slippage = book_slippage_pct(book, side, (best_bid + best_ask) / 2)
+    if slippage > 0.5:
+        raise ValueError("visible $1,000 book slippage above 0.5%")
+    latest = dict(signal)
+    latest["price"] = ticker.price
+    latest["spread_pct"] = round(spread, 3)
+    latest["book_slippage_pct"] = round(slippage, 3)
+    latest["observed_utc"] = utc(now_ms)
+    if side == "long":
+        if not (signal["price"] * 0.99 <= ticker.price <= signal["price"] * 1.01 and
+                ticker.price >= signal["breakout_level"]):
+            raise ValueError("price left long entry zone")
+        risk = 100 * (1 - signal["stop"] / ticker.price)
+        if not 0 < risk <= 7:
+            raise ValueError("long stop distance no longer valid")
+        latest["entry"] = ticker.price
+        latest["risk_pct"] = round(risk, 2)
+        latest["target1"] = ticker.price + 1.5 * (ticker.price - signal["stop"])
+    else:
+        if not signal["entry"] * 0.98 <= ticker.price <= signal["entry"] * 1.01:
+            raise ValueError("price left short entry zone")
+        risk = 100 * (signal["stop"] / ticker.price - 1)
+        if not 0 < risk <= 8:
+            raise ValueError("short stop distance no longer valid")
+        latest["entry"] = ticker.price
+        latest["risk_pct"] = round(risk, 2)
+        latest["target1"] = ticker.price - 1.5 * (signal["stop"] - ticker.price)
+        if latest.get("historical_high"):
+            latest["old_peak_multiple"] = round(latest["historical_high"] / ticker.price, 1)
+    return latest
 
 
 def main() -> int:
@@ -208,9 +295,21 @@ def main() -> int:
     if coverage["deep_count"] == 0 or len(coverage["errors"]) >= max(5, coverage["deep_count"] // 5):
         raise RuntimeError("BingX data coverage failed; no alerts sent: " +
                            "; ".join(coverage["errors"][:5]))
-    alerts = select_alerts(signals, state, now_ms)
+    if coverage["momentum_count"] and coverage["oi_failures"] == coverage["momentum_count"]:
+        raise RuntimeError("BingX open interest unavailable for all momentum candidates")
+    alerts = select_alerts(signals, state, int(time.time() * 1000))
+    if args.dry_run:
+        checked = []
+        for signal in alerts:
+            try:
+                ticker = client.ticker(signal["symbol"])
+                book = client.depth(signal["symbol"])
+                checked.append(refresh_entry(signal, ticker, book, int(time.time() * 1000)))
+            except (ValueError, RuntimeError) as error:
+                print(f"Skipped stale/illiquid {signal['symbol']}: {error}")
+        alerts = checked
     print(json.dumps({"coverage": coverage, "signals": len(signals),
-                      "alerts": [{"symbol": s["symbol"], "stage": s["stage"],
+                      "entry_candidates": [{"symbol": s["symbol"], "stage": s["stage"],
                                   "actionable": s["actionable"],
                                   "pump_pct": s.get("pump_pct"),
                                   "retrace_pct": s.get("retrace_pct"),
@@ -225,6 +324,21 @@ def main() -> int:
     for signal in alerts:
         try:
             context = client.context(signal["symbol"])
+            if signal["stage"] == "momentum_confirmed":
+                oi = context.get("open_interest") or {}
+                observed = int(number(oi.get("time")))
+                value = number(oi.get("openInterest"))
+                if not observed or abs(int(time.time() * 1000) - observed) > 120_000:
+                    raise ValueError("latest open interest stale")
+                if not signal.get("oi_baseline") or value < signal["oi_baseline"] * 1.02:
+                    raise ValueError("open interest confirmation expired")
+            ticker = client.ticker(signal["symbol"])
+            book = client.depth(signal["symbol"])
+            signal = refresh_entry(signal, ticker, book, int(time.time() * 1000))
+        except (ValueError, RuntimeError) as error:
+            print(f"Skipped stale/illiquid {signal['symbol']}: {error}")
+            continue
+        try:
             message_id = telegram_send(token, chat_id, message(signal, context))
             mark_sent(signal, state)
             state.setdefault("alert_history", []).append({

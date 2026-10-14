@@ -8,7 +8,7 @@ from pathlib import Path
 
 from monitor import (Bar, Ticker, candidates, confirm_momentum, evaluate,
                      evaluate_momentum, old_peak, updated_price_snapshots)
-from run_monitor import mark_sent, message, select_alerts
+from run_monitor import book_slippage_pct, mark_sent, message, refresh_entry, select_alerts
 from state_store import LocalStateStore
 
 FIVE = 300_000
@@ -75,14 +75,20 @@ class MonitorTests(unittest.TestCase):
         signal = {"symbol": "VELVET-USDT", "stage": "reversal", "actionable": True,
                   "peak_ms": self.now - FIVE,
                   "peak": 0.152, "pump_pct": 50, "retrace_pct": 3,
-                  "old_peak_multiple": 15, "event_ms": self.now - FIVE}
+                  "old_peak_multiple": 15, "event_ms": self.now - FIVE,
+                  "rebound3h_pct": 50}
         state = {"episodes": {}}
         alerts = select_alerts([signal], state, self.now)
         self.assertEqual(len(alerts), 1)
         mark_sent(signal, state)
         self.assertEqual(select_alerts([signal], state, self.now), [])
         newer = {**signal, "peak_ms": self.now + FIVE, "peak": 0.18}
-        self.assertEqual(len(select_alerts([newer], state, self.now + FIVE)), 1)
+        self.assertEqual(select_alerts([newer], state, self.now + FIVE), [])
+        next_cycle = {**signal, "peak_ms": self.now + 3 * 3_600_000,
+                      "peak": 0.13, "event_ms": self.now + 3 * 3_600_000 + FIVE,
+                      "rebound3h_pct": 25}
+        self.assertEqual(len(select_alerts([next_cycle], state,
+                                           self.now + 3 * 3_600_000 + 2 * FIVE)), 1)
 
     def test_only_confirmed_entry_is_selected(self):
         short = {"symbol": "VELVET-USDT", "stage": "watch", "peak_ms": self.now - FIVE,
@@ -136,6 +142,9 @@ class MonitorTests(unittest.TestCase):
         confirmed = confirm_momentum(signal, 110,
                                      {"value": 100, "at_ms": self.now - FIVE}, self.now)
         self.assertEqual(confirmed["stage"], "momentum_confirmed")
+        seeded = confirm_momentum({**signal, "price_trigger": False}, 110,
+                                  {"value": 100, "at_ms": self.now - FIVE}, self.now)
+        self.assertEqual(seeded["stage"], "momentum_watch")
         self.assertTrue(confirmed["target1"] > confirmed["entry"] > confirmed["stop"])
         rendered = message(confirmed)
         self.assertIn("🟢 #LONG", rendered)
@@ -145,10 +154,64 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("SL", rendered)
         self.assertIn("━━━━━━━━", rendered)
 
+    def test_early_growth_seeds_oi_without_sending_entry(self):
+        bars = [Bar(self.now - (40 - index) * FIVE, 1, 1.001, 0.999, 1, 100)
+                for index in range(40)]
+        for offset, close in ((-3, 1.003), (-2, 1.009), (-1, 1.016)):
+            old = bars[offset]
+            bars[offset] = Bar(old.start_ms, close * 0.998, close * 1.001,
+                               close * 0.997, close, 200)
+        ticker = Ticker("EARLY-USDT", 1.016, 1.03, 0.99,
+                        1_500_000, 1.0155, 1.0165)
+        signal = evaluate_momentum(ticker, bars, self.now)
+        self.assertIsNotNone(signal)
+        self.assertFalse(signal["price_trigger"])
+        confirmed = confirm_momentum(signal, 110,
+                                     {"value": 100, "at_ms": self.now - FIVE}, self.now)
+        self.assertEqual(select_alerts([confirmed], {"episodes": {}}, self.now), [])
+
     def test_watch_cannot_be_formatted_for_telegram(self):
         signal = evaluate(self.ticker, sample_bars(self.now), self.now, 2.16)
         with self.assertRaisesRegex(ValueError, "Only confirmed entry"):
             message(signal)
+
+    def test_entry_refresh_rejects_price_drift_and_thin_book(self):
+        signal = {"symbol": "VELVET-USDT", "stage": "reversal", "actionable": True,
+                  "event_ms": self.now - FIVE, "entry": 0.147, "stop": 0.155,
+                  "historical_high": 2.16, "price": 0.147}
+        book = {"T": self.now, "bids": [["0.1469", "10000"]],
+                "asks": [["0.1471", "10000"]]}
+        ticker = Ticker("VELVET-USDT", 0.147, 0.16, 0.1,
+                        1_000_000, 0.1469, 0.1471, self.now)
+        refreshed = refresh_entry(signal, ticker, book, self.now)
+        self.assertEqual(refreshed["price"], 0.147)
+        self.assertLess(refreshed["book_slippage_pct"], 0.5)
+        drifted = Ticker("VELVET-USDT", 0.13, 0.16, 0.1,
+                         1_000_000, 0.1469, 0.1471, self.now)
+        with self.assertRaisesRegex(ValueError, "left short entry zone"):
+            refresh_entry(signal, drifted, book, self.now)
+        thin = {"T": self.now, "bids": [["0.1469", "1"]],
+                "asks": [["0.1471", "1"]]}
+        with self.assertRaisesRegex(ValueError, "too thin"):
+            refresh_entry(signal, ticker, thin, self.now)
+
+    def test_stale_book_and_old_oi_window_fail_closed(self):
+        signal = {"symbol": "VELVET-USDT", "stage": "reversal", "actionable": True,
+                  "event_ms": self.now - FIVE, "entry": 0.147, "stop": 0.155,
+                  "price": 0.147}
+        book = {"T": self.now - 40_000, "bids": [["0.1469", "10000"]],
+                "asks": [["0.1471", "10000"]]}
+        ticker = Ticker("VELVET-USDT", 0.147, 0.16, 0.1,
+                        1_000_000, 0.1469, 0.1471, self.now)
+        with self.assertRaisesRegex(ValueError, "order book stale"):
+            refresh_entry(signal, ticker, book, self.now)
+        long_signal = {"stage": "momentum_watch", "oi_change_pct": None,
+                       "turnover_usdt": 2_000_000, "spread_pct": 0.1,
+                       "risk_pct": 3, "price": 1, "stop_candidate": 0.97}
+        confirmed = confirm_momentum(long_signal, 110,
+                                     {"value": 100, "at_ms": self.now - 50 * 60_000}, self.now)
+        self.assertFalse(confirmed.get("actionable", False))
+        self.assertIsNone(confirmed["oi_change_pct"])
 
 
 if __name__ == "__main__":

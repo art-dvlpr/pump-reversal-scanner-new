@@ -29,7 +29,7 @@ def replay(client: BingX, symbol: str) -> dict:
                         min(bar.low for bar in last_day), turnover,
                         current.close / 1.001, current.close * 1.001)
         signal = evaluate_momentum(ticker, past, now_ms)
-        if not signal or signal["gain15_pct"] < 3:
+        if not signal or not signal["price_trigger"] or signal["gain15_pct"] < 3:
             continue
         last_alert_ms = now_ms
         entry = bars[index + 1].open

@@ -99,8 +99,34 @@ class BingX:
             ask = number(row.get("askPrice"))
             if price <= 0 or high <= 0 or low <= 0:
                 continue
-            result.append(Ticker(symbol, price, high, low, number(row.get("quoteVolume")), bid, ask))
+            timestamp = int(number(row.get("closeTime")))
+            if not timestamp or abs(int(time.time() * 1000) - timestamp) > 120_000:
+                continue
+            result.append(Ticker(symbol, price, high, low, number(row.get("quoteVolume")),
+                                 bid, ask, timestamp))
         return result
+
+    def ticker(self, symbol: str) -> "Ticker":
+        row = self.get("/openApi/swap/v2/quote/ticker", symbol=symbol)
+        if isinstance(row, list):
+            row = next((item for item in row if item.get("symbol") == symbol), None)
+        if not isinstance(row, dict) or row.get("symbol") != symbol:
+            raise ValueError(f"BingX {symbol} ticker unavailable")
+        timestamp = int(number(row.get("closeTime")))
+        if not timestamp or abs(int(time.time() * 1000) - timestamp) > 120_000:
+            raise ValueError(f"BingX {symbol} ticker stale")
+        ticker = Ticker(symbol, number(row.get("lastPrice")), number(row.get("highPrice")),
+                        number(row.get("lowPrice")), number(row.get("quoteVolume")),
+                        number(row.get("bidPrice")), number(row.get("askPrice")), timestamp)
+        if ticker.price <= 0 or ticker.spread_pct == math.inf:
+            raise ValueError(f"BingX {symbol} ticker invalid")
+        return ticker
+
+    def depth(self, symbol: str) -> dict:
+        row = self.get("/openApi/swap/v2/quote/depth", symbol=symbol, limit=20)
+        if not isinstance(row, dict):
+            raise ValueError(f"BingX {symbol} order book unavailable")
+        return row
 
     def contracts(self) -> set[str]:
         rows = self.get("/openApi/swap/v2/quote/contracts")
@@ -164,6 +190,7 @@ class Ticker:
     turnover_usdt: float
     bid: float
     ask: float
+    at_ms: int = 0
 
     @property
     def range_pct(self) -> float:
@@ -215,6 +242,8 @@ def evaluate(ticker: Ticker, bars: list[Bar], now_ms: int,
         return None
     trough = min(bar.low for bar in before)
     pump_pct = 100 * (peak.high / trough - 1)
+    recent_trough = min(bar.low for bar in recent[max(0, peak_index - 36):peak_index + 1])
+    rebound3h_pct = 100 * (peak.high / recent_trough - 1)
     retrace_pct = 100 * (1 - closed[-1].close / peak.high)
     if pump_pct < 20 or peak.start_ms < now_ms - 12 * 3_600_000:
         return None
@@ -273,6 +302,7 @@ def evaluate(ticker: Ticker, bars: list[Bar], now_ms: int,
         "event_utc": utc(event.start_ms + FIVE_MINUTES), "event_ms": event.start_ms,
         "peak_utc": utc(peak.start_ms), "peak_ms": peak.start_ms,
         "peak": peak.high, "price": ticker.price, "pump_pct": round(pump_pct, 1),
+        "rebound3h_pct": round(rebound3h_pct, 1),
         "retrace_pct": round(retrace_pct, 1), "range24_pct": round(ticker.range_pct, 1),
         "turnover_usdt": round(ticker.turnover_usdt), "spread_pct": round(ticker.spread_pct, 3),
         "volume_ratio": round(volume_ratio, 2), "reversal_type": "пробой опоры" if breakdown else
@@ -301,10 +331,16 @@ def evaluate_momentum(ticker: Ticker, bars: list[Bar], now_ms: int) -> dict | No
     volume_ratio = sum(bar.volume for bar in closed[-3:]) / (3 * baseline)
     earlier_high = max(bar.high for bar in closed[-28:-3])
     distance_from_high = 100 * (1 - last.close / max(bar.high for bar in closed[-4:]))
-    if not (2 <= gain15 <= 18 and 3 <= gain60 <= 25 and volume_ratio >= 2 and
-            last.close >= earlier_high * 1.002 and distance_from_high <= 3 and
-            ticker.price >= earlier_high and ticker.price >= last.close * 0.985 and
-            ticker.price <= last.close * 1.05):
+    price_trigger = (2 <= gain15 <= 18 and 3 <= gain60 <= 25 and volume_ratio >= 2 and
+                     last.close >= earlier_high * 1.002 and distance_from_high <= 3 and
+                     ticker.price >= earlier_high and ticker.price >= last.close * 0.985 and
+                     ticker.price <= last.close * 1.05)
+    # Start collecting OI slightly before the full breakout, so the second
+    # snapshot can measure the same move instead of arriving only afterward.
+    oi_seed = (1 <= gain15 <= 18 and gain60 >= 1.5 and volume_ratio >= 1.3 and
+               last.close >= earlier_high * 0.99 and distance_from_high <= 5 and
+               ticker.price >= last.close * 0.98 and ticker.price <= last.close * 1.06)
+    if not (price_trigger or oi_seed):
         return None
     # Price strength is an observation. It becomes a conditional long scenario
     # only after a later run confirms growing open interest as well.
@@ -317,6 +353,7 @@ def evaluate_momentum(ticker: Ticker, bars: list[Bar], now_ms: int) -> dict | No
         "peak_ms": last.start_ms, "peak": last.high, "price": ticker.price,
         "gain15_pct": round(gain15, 1), "gain60_pct": round(gain60, 1),
         "volume_ratio": round(volume_ratio, 2), "breakout_level": earlier_high,
+        "price_trigger": price_trigger,
         "turnover_usdt": round(ticker.turnover_usdt), "spread_pct": round(ticker.spread_pct, 3),
         "risk_pct": round(risk_pct, 2), "stop_candidate": stop,
         "oi_change_pct": None, "actionable": False, "entry": None,
@@ -330,13 +367,16 @@ def confirm_momentum(signal: dict, current_oi: float, prior: dict | None,
     if prior and current_oi > 0:
         samples = prior.get("samples") or [prior]
         eligible = [row for row in samples if
-                    4 * 60_000 <= now_ms - row.get("at_ms", 0) <= 60 * 60_000 and
+                    4 * 60_000 <= now_ms - row.get("at_ms", 0) <= 20 * 60_000 and
                     number(row.get("value")) > 0]
         if eligible:
             baseline = min(eligible, key=lambda row: row["at_ms"])
+            signal["oi_baseline"] = number(baseline["value"])
+            signal["oi_baseline_at_ms"] = baseline["at_ms"]
             signal["oi_change_pct"] = round(100 * (current_oi / number(baseline["value"]) - 1), 2)
             signal["oi_window_min"] = round((now_ms - baseline["at_ms"]) / 60_000)
-    confirmed = (signal["oi_change_pct"] is not None and signal["oi_change_pct"] >= 2 and
+    confirmed = (signal.get("price_trigger", True) and signal["oi_change_pct"] is not None and
+                 signal["oi_change_pct"] >= 2 and
                  signal["turnover_usdt"] >= 1_000_000 and signal["spread_pct"] <= 0.4 and
                  0 < signal["risk_pct"] <= 7)
     if confirmed:
@@ -405,6 +445,7 @@ def scan_market(client: BingX, now_ms: int, history: dict,
     errors: list[str] = []
     historical_updates: dict = {}
     oi_updates: dict = {}
+    oi_failures = 0
 
     def inspect(ticker: Ticker) -> tuple[dict | None, dict | None, tuple[str, dict] | None]:
         bars = client.bars(ticker.symbol, "5m", 400)
@@ -434,19 +475,23 @@ def scan_market(client: BingX, now_ms: int, history: dict,
                 errors.append(f"{symbol}: {error}")
     # OI is a current snapshot, not a historical series. Compare only values
     # observed by this scanner on separate runs; never infer a delta from price.
-    for rising in sorted(momentum, key=lambda item: -item["gain15_pct"])[:25]:
+    for rising in sorted(momentum, key=lambda item: -item["gain15_pct"]):
         symbol = rising["symbol"]
         try:
             row = client.open_interest(symbol)
             value = number(row.get("openInterest"))
+            observed_ms = int(number(row.get("time")))
+            if not observed_ms or abs(int(time.time() * 1000) - observed_ms) > 120_000:
+                raise ValueError("open interest stale")
             previous = (oi_snapshots or {}).get(symbol)
             prior_samples = (previous.get("samples") or [previous]) if previous else []
             samples = [item for item in prior_samples if
                        now_ms - item.get("at_ms", 0) <= 60 * 60_000]
-            samples.append({"value": value, "at_ms": now_ms})
-            oi_updates[symbol] = {"value": value, "at_ms": now_ms, "samples": samples[-13:]}
-            results.append(confirm_momentum(rising, value, previous, now_ms))
+            samples.append({"value": value, "at_ms": observed_ms})
+            oi_updates[symbol] = {"value": value, "at_ms": observed_ms, "samples": samples[-13:]}
+            results.append(confirm_momentum(rising, value, previous, observed_ms))
         except Exception as error:
+            oi_failures += 1
             errors.append(f"{symbol} OI: {error}")
             rising["oi_error"] = str(error)
             results.append(rising)
@@ -455,7 +500,8 @@ def scan_market(client: BingX, now_ms: int, history: dict,
     results.sort(key=lambda item: (item["stage"] not in ("reversal", "momentum_confirmed"),
                                    -item.get("pump_pct", item.get("gain15_pct", 0))))
     return results, {"ticker_count": len(tickers), "tradable_count": len(tradable),
-                     "deep_count": len(selected), "errors": errors,
+                     "deep_count": len(selected), "momentum_count": len(momentum),
+                     "oi_failures": oi_failures, "errors": errors,
                      "history_updates": historical_updates, "oi_updates": oi_updates,
                      "price_updates": updated_price_snapshots(
                          tickers, tradable, price_snapshots or {}, now_ms)}

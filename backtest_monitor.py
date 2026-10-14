@@ -20,7 +20,6 @@ def replay_symbol(symbol: str, client: BingX, spread_assumption_pct: float = 0.2
     if len(bars) < 550:
         return {"symbol": symbol, "error": "less than 550 five-minute bars"}
     state = {"episodes": {}}
-    observations = 0
     reversal_events: list[dict] = []
     late_events = 0
     last_peak = 0
@@ -45,11 +44,6 @@ def replay_symbol(symbol: str, client: BingX, spread_assumption_pct: float = 0.2
         if not ready:
             continue
         mark_sent(signal, state)
-        if signal["stage"] == "watch":
-            observations += 1
-            continue
-        if signal["event_ms"] != current.start_ms:
-            continue
         if index + 1 >= len(bars):
             continue
         entry = bars[index + 1].open
@@ -90,8 +84,8 @@ def replay_symbol(symbol: str, client: BingX, spread_assumption_pct: float = 0.2
             "stop_first": stopped_first,
             "outcome_complete": True,
         })
-    return {"symbol": symbol, "observations": observations,
-            "late_events": late_events, "reversals": reversal_events}
+    return {"symbol": symbol, "late_events": late_events,
+            "reversals": reversal_events}
 
 
 def main() -> int:
@@ -127,8 +121,8 @@ def main() -> int:
     total = len(completed)
     result = {
         "sample_symbols": len(symbols), "symbols_with_data": sum("error" not in row for row in outputs),
+        "symbols": symbols,
         "errors": [row for row in outputs if "error" in row],
-        "watch_observations": sum(row.get("observations", 0) for row in outputs),
         "late_events": sum(row.get("late_events", 0) for row in outputs),
         "reversal_events_with_complete_12h_outcome": total,
         "reversal_events_recent_outcome_pending": len(events) - total,
