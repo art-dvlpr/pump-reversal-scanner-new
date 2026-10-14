@@ -17,7 +17,7 @@ LOCAL_PATH = Path(__file__).resolve().parent / ".state" / STATE_PATH
 
 def empty_state() -> dict:
     return {"version": 2, "history": {}, "episodes": {}, "price_snapshots": {},
-            "oi_snapshots": {}, "last_digest_day": ""}
+            "oi_snapshots": {}}
 
 
 class LocalStateStore:

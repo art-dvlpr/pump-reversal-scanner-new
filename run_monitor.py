@@ -13,7 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from monitor import BingX, PINNED, scan_market
+from monitor import BingX, scan_market
 from state_store import configured_store
 
 
@@ -59,8 +59,7 @@ def episode_for(signal: dict, episodes: dict, now_ms: int) -> dict:
     prior = episodes.get(symbol)
     if momentum:
         if not prior or now_ms - prior.get("started_ms", 0) >= 4 * 3_600_000:
-            prior = {"started_ms": now_ms, "watch_sent": False,
-                     "confirmed_sent": False}
+            prior = {"started_ms": now_ms, "confirmed_sent": False}
             episodes[symbol] = prior
         return prior
     if (not prior or
@@ -68,27 +67,24 @@ def episode_for(signal: dict, episodes: dict, now_ms: int) -> dict:
              (signal["peak"] >= prior.get("anchor_peak", 0) * 1.15 or
               now_ms - prior.get("started_ms", 0) >= 24 * 3_600_000))):
         prior = {"started_ms": now_ms, "peak_ms": signal["peak_ms"],
-                 "anchor_peak": signal["peak"], "watch_sent": False,
-                 "reversal_sent": False}
+                 "anchor_peak": signal["peak"], "reversal_sent": False}
         episodes[symbol] = prior
     return prior
 
 
 def should_send(signal: dict, episode: dict, now_ms: int) -> bool:
-    if signal["stage"] == "momentum_watch":
-        return (not episode["watch_sent"] and signal["gain15_pct"] >= 3 and
-                (signal.get("oi_change_pct") is None or signal["oi_change_pct"] >= 0))
-    if signal["stage"] == "momentum_confirmed":
-        return not episode["confirmed_sent"] and now_ms - signal["event_ms"] <= 20 * 60_000
-    if signal["stage"] == "late":
+    if not signal.get("actionable"):
         return False
-    profile = signal["old_peak_multiple"] is not None and signal["old_peak_multiple"] >= 2
-    if signal["stage"] == "watch":
-        return (not episode["watch_sent"] and signal["pump_pct"] >= 25 and
-                signal["retrace_pct"] <= 12 and (profile or signal["symbol"] in PINNED))
+    if signal["stage"] == "momentum_confirmed":
+        return (not episode["confirmed_sent"] and
+                0 <= now_ms - signal["event_ms"] <= 20 * 60_000)
+    if signal["stage"] != "reversal":
+        return False
+    profile = (signal.get("old_peak_multiple") is not None and
+               signal["old_peak_multiple"] >= 2)
     return (not episode["reversal_sent"] and
             (profile or signal["pump_pct"] >= 40) and
-            now_ms - signal["event_ms"] <= 25 * 60_000)
+            0 <= now_ms - signal["event_ms"] <= 25 * 60_000)
 
 
 def format_price(value: float, precision: int | None = None) -> str:
@@ -103,11 +99,12 @@ def local_time(utc_text: str) -> str:
 
 
 def message(signal: dict, context: dict | None = None) -> str:
+    if not signal.get("actionable") or signal["stage"] not in ("reversal", "momentum_confirmed"):
+        raise ValueError("Only confirmed entry conditions can be sent to Telegram")
     stage = signal["stage"]
     momentum = stage.startswith("momentum_")
     side = "🟢 #LONG" if momentum else "🔴 #SHORT"
-    status = ("УСЛОВИЯ ВХОДА — проверь цену" if signal["actionable"] else
-              "НАБЛЮДАЕМ — вход не подтверждён")
+    status = "УСЛОВИЯ ВХОДА — проверь цену"
     symbol = html.escape(signal["symbol"].replace("-", "/"))
     price = lambda value: format_price(value, signal.get("price_precision"))
     lines = [f"<b>{side} — {symbol}</b> · BingX Futures",
@@ -129,29 +126,18 @@ def message(signal: dict, context: dict | None = None) -> str:
         if signal.get("reversal_type"):
             lines.append(f"📉 Признак: {html.escape(signal['reversal_type'])}")
     lines.append("━━━━━━━━━━━━━━━━━━")
-    if signal["actionable"]:
-        entry, stop = signal["entry"], signal["stop"]
-        unit = abs(entry - stop)
-        direction = 1 if momentum else -1
-        targets = [entry + direction * unit * multiple for multiple in (1, 1.5, 2)]
-        lines.extend([f"🔹 <b>Точка входа:</b> около {price(entry)} USDT",
-                      "🎯 <b>Расчётные цели (Take-Profit):</b>",
-                      f"   TP1 · {price(targets[0])} USDT (1R)",
-                      f"   TP2 · {price(targets[1])} USDT (1,5R)",
-                      f"   TP3 · {price(targets[2])} USDT (2R)",
-                      f"🔴 <b>Стоп-лосс (SL) / отмена:</b> {price(stop)} USDT",
-                      f"⚠️ Риск до стопа: {signal['risk_pct']}% цены. "
-                      "Размер позиции рассчитай вручную; ориентир — риск до 2% капитала."])
-    elif momentum:
-        lines.extend([f"👀 Условие: удержание выше {price(signal['breakout_level'])} "
-                      "и рост OI на следующем замере",
-                      "🔹 Вход · TP · SL: после подтверждения",
-                      "⚠️ Риск: вход ещё не подтверждён"])
-    else:
-        lines.extend([f"👀 Условие: 5м пробой/отказ у {price(signal.get('level', signal['peak']))}",
-                      f"🔴 Отмена наблюдения: новый пик выше {price(signal['peak'])}",
-                      "🔹 Вход · TP · SL: после подтверждения",
-                      "⚠️ Риск: вход ещё не подтверждён"])
+    entry, stop = signal["entry"], signal["stop"]
+    unit = abs(entry - stop)
+    direction = 1 if momentum else -1
+    targets = [entry + direction * unit * multiple for multiple in (1, 1.5, 2)]
+    lines.extend([f"🔹 <b>Точка входа:</b> около {price(entry)} USDT",
+                  "🎯 <b>Расчётные цели (Take-Profit):</b>",
+                  f"   TP1 · {price(targets[0])} USDT (1R)",
+                  f"   TP2 · {price(targets[1])} USDT (1,5R)",
+                  f"   TP3 · {price(targets[2])} USDT (2R)",
+                  f"🔴 <b>Стоп-лосс (SL) / отмена:</b> {price(stop)} USDT",
+                  f"⚠️ Риск до стопа: {signal['risk_pct']}% цены. "
+                  "Размер позиции рассчитай вручную; ориентир — риск до 2% капитала."])
     lines.extend(["━━━━━━━━━━━━━━━━━━",
                   f"💧 Оборот 24ч: {signal['turnover_usdt']:,} USDT · спред: {signal['spread_pct']}%"])
     if context:
@@ -174,15 +160,11 @@ def message(signal: dict, context: dict | None = None) -> str:
 def select_alerts(signals: list[dict], state: dict, now_ms: int) -> list[dict]:
     episodes = state.setdefault("episodes", {})
     ready: list[dict] = []
-    confirmed_reversals = {item["symbol"] for item in signals if item["stage"] == "reversal"}
-    rising_symbols = {item["symbol"] for item in signals
-                      if item["stage"].startswith("momentum_")}
-    for signal in sorted(signals, key=lambda item: (item["stage"] not in
-                                                   ("reversal", "momentum_confirmed"),
-                                                   -item.get("pump_pct", item.get("gain15_pct", 0)))):
+    eligible = [item for item in signals if item.get("actionable") and
+                item["stage"] in ("reversal", "momentum_confirmed")]
+    confirmed_reversals = {item["symbol"] for item in eligible if item["stage"] == "reversal"}
+    for signal in sorted(eligible, key=lambda item: -item.get("pump_pct", item.get("gain15_pct", 0))):
         if signal["stage"].startswith("momentum_") and signal["symbol"] in confirmed_reversals:
-            continue
-        if signal["stage"] == "watch" and signal["symbol"] in rising_symbols:
             continue
         episode = episode_for(signal, episodes, now_ms)
         if should_send(signal, episode, now_ms):
@@ -194,33 +176,8 @@ def mark_sent(signal: dict, state: dict) -> None:
     momentum = signal["stage"].startswith("momentum_")
     key = signal["symbol"] + "#momentum" if momentum else signal["symbol"]
     episode = state["episodes"][key]
-    field = ("confirmed_sent" if signal["stage"] == "momentum_confirmed" else
-             "watch_sent" if signal["stage"] in ("watch", "momentum_watch") else
-             "reversal_sent")
+    field = "confirmed_sent" if momentum else "reversal_sent"
     episode[field] = True
-
-
-def daily_digest_due(state: dict, now_ms: int) -> tuple[bool, str]:
-    local = datetime.fromtimestamp(now_ms / 1000, timezone(timedelta(hours=3)))
-    day = local.strftime("%Y-%m-%d")
-    return local.hour >= 9 and state.get("last_digest_day") != day, day
-
-
-def daily_digest(state: dict, coverage: dict, now_ms: int) -> str:
-    recent = [row for row in state.get("alert_history", [])
-              if 0 <= now_ms - row.get("at_ms", 0) <= 24 * 3_600_000]
-    short = sum(row["side"] == "short" for row in recent)
-    long = sum(row["side"] == "long" for row in recent)
-    return ("<b>📋 BingX · отчёт за последние 24 часа</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🔴 Short-наблюдений/сценариев: {short}\n"
-            f"🟢 Long-наблюдений/сценариев: {long}\n"
-            f"🔎 Контрактов в последнем обзоре: {coverage['tradable_count']}; "
-            f"проверены свечи: {coverage['deep_count']}\n"
-            f"🕒 Последняя проверка: {datetime.fromtimestamp(now_ms / 1000, timezone(timedelta(hours=3))).strftime('%d.%m %H:%M МСК')}\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            + ("Новых подтверждённых условий за сутки может не быть; входы не выдумываются."
-               if not recent else "Сценарии остаются условными; сделки только вручную."))
 
 
 def main() -> int:
@@ -267,7 +224,7 @@ def main() -> int:
     failures = []
     for signal in alerts:
         try:
-            context = client.context(signal["symbol"]) if signal["actionable"] else None
+            context = client.context(signal["symbol"])
             message_id = telegram_send(token, chat_id, message(signal, context))
             mark_sent(signal, state)
             state.setdefault("alert_history", []).append({
@@ -278,14 +235,6 @@ def main() -> int:
             failures.append(f"{signal['symbol']}: {error}")
     state["alert_history"] = [row for row in state.get("alert_history", [])
                               if 0 <= now_ms - row.get("at_ms", 0) <= 24 * 3_600_000]
-    due, day = daily_digest_due(state, now_ms)
-    if due:
-        try:
-            message_id = telegram_send(token, chat_id, daily_digest(state, coverage, now_ms))
-            state["last_digest_day"] = day
-            print(f"Telegram accepted daily digest message_id={message_id}")
-        except Exception as error:
-            failures.append(f"Daily digest: {error}")
     # The latest ticker/OI snapshots make five-minute changes measurable.
     if json.dumps(state, sort_keys=True) != before:
         store.save(state)

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from monitor import (Bar, Ticker, candidates, confirm_momentum, evaluate,
                      evaluate_momentum, old_peak, updated_price_snapshots)
-from run_monitor import daily_digest, daily_digest_due, episode_for, mark_sent, message, select_alerts
+from run_monitor import mark_sent, message, select_alerts
 from state_store import LocalStateStore
 
 FIVE = 300_000
@@ -72,7 +72,8 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(old_peak(history, month_start + 3 * 86_400_000), 2.16)
 
     def test_alert_state_deduplicates_same_episode(self):
-        signal = {"symbol": "VELVET-USDT", "stage": "watch", "peak_ms": self.now - FIVE,
+        signal = {"symbol": "VELVET-USDT", "stage": "reversal", "actionable": True,
+                  "peak_ms": self.now - FIVE,
                   "peak": 0.152, "pump_pct": 50, "retrace_pct": 3,
                   "old_peak_multiple": 15, "event_ms": self.now - FIVE}
         state = {"episodes": {}}
@@ -83,14 +84,21 @@ class MonitorTests(unittest.TestCase):
         newer = {**signal, "peak_ms": self.now + FIVE, "peak": 0.18}
         self.assertEqual(len(select_alerts([newer], state, self.now + FIVE)), 1)
 
-    def test_same_symbol_does_not_get_opposing_watch_alerts(self):
+    def test_only_confirmed_entry_is_selected(self):
         short = {"symbol": "VELVET-USDT", "stage": "watch", "peak_ms": self.now - FIVE,
                  "peak": 0.15, "pump_pct": 30, "retrace_pct": 2,
-                 "old_peak_multiple": 10, "event_ms": self.now - FIVE}
-        long = {"symbol": "VELVET-USDT", "stage": "momentum_watch",
-                "gain15_pct": 4, "oi_change_pct": None, "event_ms": self.now - FIVE}
-        alerts = select_alerts([short, long], {"episodes": {}}, self.now)
-        self.assertEqual([item["stage"] for item in alerts], ["momentum_watch"])
+                 "old_peak_multiple": 10, "event_ms": self.now - FIVE,
+                 "actionable": False}
+        long_watch = {"symbol": "VELVET-USDT", "stage": "momentum_watch",
+                      "gain15_pct": 4, "oi_change_pct": None,
+                      "event_ms": self.now - FIVE, "actionable": False}
+        long_entry = {**long_watch, "stage": "momentum_confirmed", "actionable": True}
+        state = {"episodes": {}}
+        alerts = select_alerts([short, long_watch, long_entry], state, self.now)
+        self.assertEqual(alerts, [long_entry])
+        self.assertEqual(list(state["episodes"]), ["VELVET-USDT#momentum"])
+        mark_sent(long_entry, state)
+        self.assertEqual(select_alerts([short, long_watch, long_entry], state, self.now), [])
 
     def test_local_state_survives_new_run(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -137,23 +145,10 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("SL", rendered)
         self.assertIn("━━━━━━━━", rendered)
 
-    def test_watch_does_not_display_unconfirmed_targets(self):
+    def test_watch_cannot_be_formatted_for_telegram(self):
         signal = evaluate(self.ticker, sample_bars(self.now), self.now, 2.16)
-        rendered = message(signal)
-        self.assertIn("🔴 #SHORT", rendered)
-        self.assertIn("НАБЛЮДАЕМ", rendered)
-        self.assertNotIn("TP1", rendered)
-
-    def test_daily_status_is_not_presented_as_a_trading_signal(self):
-        # Choose a known Moscow morning independently of test fixture clock.
-        from datetime import datetime, timezone
-        now = int(datetime(2027, 1, 1, 7, 0, tzinfo=timezone.utc).timestamp() * 1000)
-        due, day = daily_digest_due({}, now)
-        self.assertTrue(due)
-        self.assertFalse(daily_digest_due({"last_digest_day": day}, now)[0])
-        report = daily_digest({}, {"tradable_count": 900, "deep_count": 200}, now)
-        self.assertIn("Новых подтверждённых условий за сутки может не быть", report)
-        self.assertNotIn("Точка входа", report)
+        with self.assertRaisesRegex(ValueError, "Only confirmed entry"):
+            message(signal)
 
 
 if __name__ == "__main__":
