@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from monitor import BingX, FIVE_MINUTES, number, scan_market, utc
+from performance import advance_evaluations, prepare_milestone_report, record_alert
 from state_store import configured_store
 
 
@@ -339,16 +340,27 @@ def main() -> int:
             print(f"Skipped stale/illiquid {signal['symbol']}: {error}")
             continue
         try:
+            strategy_version = os.environ.get("GITHUB_SHA", "local")
+            record_alert(signal, context, int(time.time() * 1000), strategy_version)
             message_id = telegram_send(token, chat_id, message(signal, context))
+            sent_at_ms = int(time.time() * 1000)
+            candidate_record = record_alert(signal, context, sent_at_ms, strategy_version)
             mark_sent(signal, state)
+            state.setdefault("evaluations", []).append(candidate_record)
             state.setdefault("alert_history", []).append({
-                "at_ms": now_ms,
+                "at_ms": sent_at_ms,
                 "side": "long" if signal["stage"].startswith("momentum_") else "short"})
             print(f"Telegram accepted {signal['symbol']} {signal['stage']} message_id={message_id}")
         except Exception as error:
             failures.append(f"{signal['symbol']}: {error}")
+    pruning_ms = int(time.time() * 1000)
     state["alert_history"] = [row for row in state.get("alert_history", [])
-                              if 0 <= now_ms - row.get("at_ms", 0) <= 24 * 3_600_000]
+                              if 0 <= pruning_ms - row.get("at_ms", 0) <= 24 * 3_600_000]
+    evaluation = advance_evaluations(client, state, int(time.time() * 1000))
+    report = prepare_milestone_report(state, int(time.time() * 1000))
+    print(json.dumps({"evaluation": evaluation,
+                      "report_ready": report["milestone"] if report else None},
+                     ensure_ascii=False))
     # The latest ticker/OI snapshots make five-minute changes measurable.
     if json.dumps(state, sort_keys=True) != before:
         store.save(state)
