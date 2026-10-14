@@ -5,7 +5,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+import run_monitor
 from monitor import (Bar, Ticker, candidates, confirm_momentum, evaluate,
                      evaluate_momentum, old_peak, updated_price_snapshots)
 from run_monitor import book_slippage_pct, mark_sent, message, refresh_entry, select_alerts
@@ -212,6 +214,35 @@ class MonitorTests(unittest.TestCase):
                                      {"value": 100, "at_ms": self.now - 50 * 60_000}, self.now)
         self.assertFalse(confirmed.get("actionable", False))
         self.assertIsNone(confirmed["oi_change_pct"])
+
+    def test_main_processes_confirmed_long_without_crashing(self):
+        now_ms = int(run_monitor.time.time() * 1000)
+        signal = {"symbol": "TEST-USDT", "stage": "momentum_confirmed",
+                  "actionable": True, "entry": 100, "stop": 95,
+                  "oi_baseline": 100}
+        store = Mock()
+        store.load.return_value = {"history": {}, "episodes": {},
+                                   "price_snapshots": {}, "oi_snapshots": {}}
+        client = Mock()
+        client.context.return_value = {"open_interest": {
+            "time": now_ms, "openInterest": 110}}
+        coverage = {"history_updates": {}, "price_updates": {}, "oi_updates": {},
+                    "deep_count": 1, "errors": [], "momentum_count": 1,
+                    "oi_failures": 0}
+        with (patch.object(run_monitor, "configured_store", return_value=store),
+              patch.object(run_monitor, "BingX", return_value=client),
+              patch.object(run_monitor, "scan_market", return_value=([signal], coverage)),
+              patch.object(run_monitor, "select_alerts", return_value=[signal]),
+              patch.object(run_monitor, "refresh_entry", return_value=signal),
+              patch.object(run_monitor, "message", return_value="entry"),
+              patch.object(run_monitor, "mark_sent"),
+              patch.object(run_monitor, "advance_evaluations", return_value={"pending": 1}),
+              patch.object(run_monitor, "telegram_credentials", return_value=("token", "chat")),
+              patch.object(run_monitor, "telegram_send", return_value=42) as send,
+              patch.object(run_monitor.sys, "argv", ["run_monitor.py"])):
+            self.assertEqual(run_monitor.main(), 0)
+        send.assert_called_once_with("token", "chat", "entry")
+        store.save.assert_called_once()
 
 
 if __name__ == "__main__":

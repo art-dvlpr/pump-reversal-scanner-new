@@ -276,9 +276,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.test_telegram:
         token, chat_id = telegram_credentials()
-        number = telegram_send(token, chat_id, "Тест нового сканера BingX: Telegram подключён; "
-                               "сделки остаются ручными.")
-        print(f"Telegram accepted message_id={number}")
+        test_message_id = telegram_send(token, chat_id, "Тест нового сканера BingX: Telegram подключён; "
+                                        "сделки остаются ручными.")
+        print(f"Telegram accepted message_id={test_message_id}")
         return 0
     store = configured_store()
     state = store.load()
