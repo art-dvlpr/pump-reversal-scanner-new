@@ -309,26 +309,29 @@ def evaluate(ticker: Ticker, bars: list[Bar], now_ms: int,
     # A renewed peak invalidates the near-top reversal thesis.
     stop = peak.high * 1.005
     risk_pct = 100 * (stop / entry - 1) if entry > 0 else math.inf
-    target = base + 0.1 * (peak.high - base)
-    route_pct = 100 * (1 - target / entry) if entry > 0 else 0
-    reward_risk = (entry - target) / (stop - entry) if stop > entry else 0
+    base_target = base + 0.1 * (peak.high - base)
+    base_route_pct = 100 * (1 - base_target / entry) if entry > 0 else 0
+    main_target = entry * (1 - SHORT_MIN_ROUTE_PCT / 100)
+    reward_risk = (entry - main_target) / (stop - entry) if stop > entry else 0
     old_multiple = historical_high / ticker.price if historical_high else 0
     actionable = (actionable and stage == "reversal" and
                   old_multiple >= SHORT_MIN_OLD_PEAK_MULTIPLE and
                   pump_pct >= SHORT_MIN_PUMP_PCT and
                   retrace_pct <= SHORT_MAX_RETRACE_PCT and
-                  route_pct >= SHORT_MIN_ROUTE_PCT and
+                  base_route_pct >= SHORT_MIN_ROUTE_PCT and
                   reward_risk >= SHORT_MIN_REWARD_RISK and
                   0 < risk_pct <= SHORT_MAX_RISK_PCT and
                   ticker.price >= entry * 0.98 and ticker.price <= entry * 1.01)
-    target1 = target if actionable else None
+    target1 = main_target if actionable else None
     return {
         "exchange": "BingX", "symbol": ticker.symbol, "stage": stage,
         "observed_utc": utc(now_ms), "last_closed_utc": utc(last.start_ms + FIVE_MINUTES),
         "event_utc": utc(event.start_ms + FIVE_MINUTES), "event_ms": event.start_ms,
         "peak_utc": utc(peak.start_ms), "peak_ms": peak.start_ms,
-        "peak": peak.high, "pump_base": base, "pump_target": target,
-        "route_pct": round(route_pct, 1), "reward_risk": round(reward_risk, 1),
+        "peak": peak.high, "pump_base": base, "pump_target": base_target,
+        "base_route_pct": round(base_route_pct, 1),
+        "main_target": main_target, "route_pct": SHORT_MIN_ROUTE_PCT,
+        "reward_risk": round(reward_risk, 1),
         "price": ticker.price, "pump_pct": round(pump_pct, 1),
         "rebound3h_pct": round(rebound3h_pct, 1),
         "retrace_pct": round(retrace_pct, 1), "range24_pct": round(ticker.range_pct, 1),
@@ -485,7 +488,7 @@ def scan_market(client: BingX, now_ms: int, history: dict,
         needs_history = (result and result["stage"] == "reversal" and
                          result["pump_pct"] >= SHORT_MIN_PUMP_PCT and
                          result["retrace_pct"] <= SHORT_MAX_RETRACE_PCT and
-                         result["route_pct"] >= SHORT_MIN_ROUTE_PCT and
+                         result["base_route_pct"] >= SHORT_MIN_ROUTE_PCT and
                          result["risk_pct"] <= SHORT_MAX_RISK_PCT)
         cache_age = DAY if high is None or high / ticker.price < SHORT_MIN_OLD_PEAK_MULTIPLE else 7 * DAY
         if needs_history and (not old or now_ms - int(old.get("checked_ms", 0)) > cache_age):

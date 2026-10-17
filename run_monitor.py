@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import os
 import sys
 import time
@@ -87,9 +88,10 @@ def should_send(signal: dict, episode: dict, now_ms: int) -> bool:
             (signal.get("old_peak_multiple") or 0) >= SHORT_MIN_OLD_PEAK_MULTIPLE and
             signal.get("pump_pct", 0) >= SHORT_MIN_PUMP_PCT and
             signal.get("retrace_pct", 100) <= SHORT_MAX_RETRACE_PCT and
+            signal.get("base_route_pct", 0) >= SHORT_MIN_ROUTE_PCT and
             signal.get("route_pct", 0) >= SHORT_MIN_ROUTE_PCT and
             signal.get("reward_risk", 0) >= SHORT_MIN_REWARD_RISK and
-            signal.get("pump_target", 0) > 0 and
+            signal.get("main_target", 0) > 0 and
             0 <= now_ms - signal["event_ms"] <= 25 * 60_000)
 
 
@@ -97,6 +99,22 @@ def format_price(value: float, precision: int | None = None) -> str:
     digits = max(0, min(12, precision if precision is not None else 8))
     rendered = f"{value:.{digits}f}"
     return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def short_target(entry: float, precision: int | None) -> float:
+    """Round a short TP down to the exchange precision, preserving >=20% price drop."""
+    raw = entry * (1 - SHORT_MIN_ROUTE_PCT / 100)
+    if precision is None:
+        return raw
+    scale = 10 ** max(0, min(12, precision))
+    return math.floor(raw * scale) / scale
+
+
+def short_stop(stop: float, precision: int | None) -> float:
+    if precision is None:
+        return stop
+    scale = 10 ** max(0, min(12, precision))
+    return math.ceil(stop * scale) / scale
 
 
 def local_time(utc_text: str) -> str:
@@ -136,10 +154,12 @@ def message(signal: dict, context: dict | None = None) -> str:
     if momentum:
         raise ValueError("Long alerts are disabled")
     lines.extend([f"🔹 <b>Условный вход:</b> около {price(entry)} USDT",
-                  f"🎯 <b>Главная цель:</b> {price(signal['pump_target'])} USDT "
-                  f"(почти у основания пампа {price(signal['pump_base'])})",
-                  f"📏 Потенциал до цели: {signal['route_pct']}% цены · "
-                  f"цель/риск: {signal['reward_risk']}R",
+                  f"🎯 <b>Главная цель:</b> {price(signal['main_target'])} USDT "
+                  f"(снижение цены от входа ≥{SHORT_MIN_ROUTE_PCT}%)",
+                  f"📏 Основание пампа: {price(signal['pump_base'])} USDT · "
+                  f"путь к нему: {signal['base_route_pct']}%",
+                  f"📊 Цель/риск: {signal['reward_risk']}R · "
+                  f"потенциал до TP: {signal['route_pct']}% цены",
                   f"🛑 <b>Отмена сценария:</b> {price(stop)} USDT "
                   "(обновление пика)",
                   f"⚠️ До отмены: {signal['risk_pct']}% цены. "
@@ -257,18 +277,24 @@ def refresh_entry(signal: dict, ticker, book: dict, now_ms: int) -> dict:
     else:
         if not signal["entry"] * 0.98 <= ticker.price <= signal["entry"] * 1.01:
             raise ValueError("price left short entry zone")
-        risk = 100 * (signal["stop"] / ticker.price - 1)
+        stop = short_stop(signal["stop"], signal.get("price_precision"))
+        risk = 100 * (stop / ticker.price - 1)
         if not 0 < risk <= SHORT_MAX_RISK_PCT:
             raise ValueError("short stop distance no longer valid")
         latest["entry"] = ticker.price
+        latest["stop"] = stop
         latest["risk_pct"] = round(risk, 2)
-        latest["target1"] = signal["pump_target"]
-        latest["route_pct"] = round(100 * (1 - signal["pump_target"] / ticker.price), 1)
-        latest["reward_risk"] = round((ticker.price - signal["pump_target"]) /
-                                      (signal["stop"] - ticker.price), 1)
-        if (latest["route_pct"] < SHORT_MIN_ROUTE_PCT or
-                latest["reward_risk"] < SHORT_MIN_REWARD_RISK):
-            raise ValueError("pump-base route no longer large enough")
+        base_route = 100 * (1 - signal["pump_target"] / ticker.price)
+        target = short_target(ticker.price, signal.get("price_precision"))
+        route = 100 * (1 - target / ticker.price)
+        reward_risk = (ticker.price - target) / (stop - ticker.price)
+        if (target <= 0 or base_route + 1e-9 < SHORT_MIN_ROUTE_PCT or
+                route + 1e-9 < SHORT_MIN_ROUTE_PCT or reward_risk < SHORT_MIN_REWARD_RISK):
+            raise ValueError("20% short route no longer valid")
+        latest["main_target"] = latest["target1"] = target
+        latest["base_route_pct"] = round(base_route, 1)
+        latest["route_pct"] = round(route, 1)
+        latest["reward_risk"] = round(reward_risk, 1)
         if latest.get("historical_high"):
             latest["old_peak_multiple"] = round(latest["historical_high"] / ticker.price, 1)
     return latest

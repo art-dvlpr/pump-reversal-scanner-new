@@ -11,7 +11,8 @@ import run_monitor
 from monitor import (Bar, Ticker, candidates, confirm_momentum, evaluate,
                      evaluate_momentum, old_peak, prior_daily_peak,
                      scan_market, updated_price_snapshots)
-from run_monitor import book_slippage_pct, mark_sent, message, refresh_entry, select_alerts
+from run_monitor import (book_slippage_pct, mark_sent, message, refresh_entry,
+                         select_alerts, short_target)
 from state_store import LocalStateStore
 
 FIVE = 300_000
@@ -64,8 +65,10 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(result["pump_base"], 0.1)
         self.assertLess(result["pump_base"], result["pump_target"])
         self.assertLess(result["pump_target"], result["entry"])
+        self.assertGreaterEqual(result["base_route_pct"], 20)
         self.assertGreaterEqual(result["route_pct"], 20)
-        self.assertIn("цель", message(result))
+        self.assertAlmostEqual(result["main_target"], result["entry"] * 0.8)
+        self.assertIn("≥20%", message(result))
 
     def test_forming_candle_cannot_create_signal(self):
         bars = sample_bars(self.now)
@@ -132,8 +135,9 @@ class MonitorTests(unittest.TestCase):
                   "peak_ms": self.now - FIVE,
                   "peak": 0.152, "pump_pct": 50, "retrace_pct": 3,
                   "old_peak_multiple": 15, "event_ms": self.now - FIVE,
-                  "rebound3h_pct": 50, "route_pct": 25,
-                  "reward_risk": 3, "pump_target": 0.105}
+                  "rebound3h_pct": 50, "route_pct": 20,
+                  "base_route_pct": 25, "reward_risk": 3,
+                  "pump_target": 0.105, "main_target": 0.1176}
         state = {"episodes": {}}
         alerts = select_alerts([signal], state, self.now)
         self.assertEqual(len(alerts), 1)
@@ -228,9 +232,9 @@ class MonitorTests(unittest.TestCase):
 
     def test_entry_refresh_rejects_price_drift_and_thin_book(self):
         signal = {"symbol": "VELVET-USDT", "stage": "reversal", "actionable": True,
-                  "event_ms": self.now - FIVE, "entry": 0.147, "stop": 0.155,
+                  "event_ms": self.now - FIVE, "entry": 0.147, "stop": 0.1550001,
                   "historical_high": 2.16, "price": 0.147,
-                  "pump_target": 0.105}
+                  "pump_target": 0.105, "price_precision": 3}
         book = {"T": self.now, "bids": [["0.1469", "10000"]],
                 "asks": [["0.1471", "10000"]]}
         ticker = Ticker("VELVET-USDT", 0.147, 0.16, 0.1,
@@ -238,6 +242,9 @@ class MonitorTests(unittest.TestCase):
         refreshed = refresh_entry(signal, ticker, book, self.now)
         self.assertEqual(refreshed["price"], 0.147)
         self.assertLess(refreshed["book_slippage_pct"], 0.5)
+        self.assertEqual(refreshed["stop"], 0.156)
+        self.assertGreaterEqual(100 * (1 - refreshed["main_target"] / refreshed["entry"]), 20)
+        self.assertEqual(refreshed["main_target"], short_target(0.147, 3))
         drifted = Ticker("VELVET-USDT", 0.13, 0.16, 0.1,
                          1_000_000, 0.1469, 0.1471, self.now)
         with self.assertRaisesRegex(ValueError, "left short entry zone"):

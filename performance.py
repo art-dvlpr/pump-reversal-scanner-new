@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from monitor import FIVE_MINUTES, Bar, closed_bars, number, utc
 
 HORIZON_MS = 24 * 3_600_000
-PUMP_BASE_HORIZON_MS = 72 * 3_600_000
+SHORT_HORIZON_MS = 72 * 3_600_000
 REPORT_EVERY = 100
 MAX_RECORDS = 300
 DIGEST_INTERVAL_MS = 3 * 24 * 3_600_000
@@ -37,10 +37,14 @@ def record_alert(signal: dict, context: dict, sent_at_ms: int,
         raise ValueError("Invalid entry or stop for outcome tracking")
     direction = -1 if side == "short" else 1
     start_ms = ((sent_at_ms + FIVE_MINUTES - 1) // FIVE_MINUTES) * FIVE_MINUTES
+    price_drop_20 = side == "short" and signal.get("main_target") is not None
     structural = side == "short" and signal.get("pump_target") is not None
-    target = number(signal.get("pump_target")) if structural else None
+    target = number(signal.get("main_target") if price_drop_20 else
+                    signal.get("pump_target")) if structural else None
     if structural and not 0 < target < entry:
-        raise ValueError("Invalid pump-base target for outcome tracking")
+        raise ValueError("Invalid short target for outcome tracking")
+    if price_drop_20 and 100 * (1 - target / entry) < 20 - 1e-9:
+        raise ValueError("Short target must require at least 20% price decline")
     targets = [target] if structural else [entry + direction * risk * multiple
                                            for multiple in (1, 1.5, 2)]
     funding = context.get("funding") or {}
@@ -51,14 +55,17 @@ def record_alert(signal: dict, context: dict, sent_at_ms: int,
         "strategy_version": strategy_version,
         "sent_at_ms": sent_at_ms, "first_full_bar_ms": start_ms,
         "next_bar_ms": start_ms, "end_ms": start_ms + (
-            PUMP_BASE_HORIZON_MS if structural else HORIZON_MS),
+            SHORT_HORIZON_MS if structural else HORIZON_MS),
         "entry": entry, "stop": stop,
         "targets": targets,
-        "target_scheme": "pump_base_90" if structural else "risk_multiple",
+        "target_scheme": "price_drop_20" if price_drop_20 else
+        "pump_base_90" if structural else "risk_multiple",
         "features": {
             "pump_pct": signal.get("pump_pct"),
             "pump_base": signal.get("pump_base"),
             "pump_target": signal.get("pump_target"),
+            "main_target": signal.get("main_target"),
+            "base_route_pct": signal.get("base_route_pct"),
             "route_pct": signal.get("route_pct"),
             "reward_risk": signal.get("reward_risk"),
             "retrace_pct": signal.get("retrace_pct"),
@@ -327,13 +334,15 @@ def render_digest(report: dict) -> str:
              f"🕒 {msk(report['since_ms'])} — {msk(report['until_ms'])} МСК",
              "━━━━━━━━━━━━━━━━━━",
              f"✅ Завершено за период: <b>{report['complete_total']}</b>"]
-    structural = summary.get("by_scheme", {}).get("pump_base_90")
-    if structural:
-        lines.append(f"🔴 Новые SHORT · цель у основания пампа, 72ч: {structural['n']} · "
-                     f"цель раньше отмены: {structural['tp_first']} · "
-                     f"отмена раньше цели: {structural['sl_first']} · "
-                     f"в одной свече: {structural['same_bar']} · "
-                     f"без касания: {structural['neither']}")
+    for scheme, label in (("price_drop_20", "🔴 Новые SHORT · снижение цены ≥20%, 72ч"),
+                          ("pump_base_90", "🔴 Прежние SHORT · цель у основания, 72ч")):
+        structural = summary.get("by_scheme", {}).get(scheme)
+        if structural:
+            lines.append(f"{label}: {structural['n']} · "
+                         f"цель раньше отмены: {structural['tp_first']} · "
+                         f"отмена раньше цели: {structural['sl_first']} · "
+                         f"в одной свече: {structural['same_bar']} · "
+                         f"без касания: {structural['neither']}")
     for side, label in (("short", "🔴"), ("long", "🟢")):
         legacy = summary.get("by_side_scheme", {}).get(f"{side}:risk_multiple")
         if legacy and legacy["n"]:
@@ -381,11 +390,12 @@ def prepare_milestone_report(state: dict, now_ms: int) -> dict | None:
 def render_report(report: dict) -> str:
     summary = report["summary"]
     lines = [f"# Проверка {summary['sample_count']} сигналов · рубеж {report['milestone']}",
-             f"Создано: {report['generated_utc']} · новая цель у основания: 72ч; старые цели 1R: 24ч.",
+             f"Создано: {report['generated_utc']} · новые SHORT ≥20%: 72ч; старые цели 1R: 24ч.",
              "Это исходы сигналов по свечам, не фактические сделки пользователя. "
              "Учтена цена последней сделки, без комиссий, funding и проскальзывания.",
              f"Исключено из статистики из-за пробелов данных: {report.get('data_gap_total', 0)}.", ""]
-    groups = (("short:pump_base_90", "🔴 Новые SHORT · цель у основания"),
+    groups = (("short:price_drop_20", "🔴 Новые SHORT · снижение цены ≥20%"),
+              ("short:pump_base_90", "🔴 Прежние SHORT · цель у основания"),
               ("short:risk_multiple", "🔴 Ранее отправленные SHORT · старая цель 1R"),
               ("long:risk_multiple", "🟢 Ранее отправленные LONG · старая цель 1R"))
     for group, label in groups:

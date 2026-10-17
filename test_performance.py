@@ -59,24 +59,36 @@ class PerformanceTests(unittest.TestCase):
         advance_evaluations(FakeBingX(bars), state, start + 2 * FIVE_MINUTES)
         self.assertEqual(state["completed_total"], 1)
 
-    def test_new_short_uses_pump_base_target_and_seventy_two_hours(self):
+    def test_new_short_tracks_twenty_percent_target_and_seventy_two_hours(self):
         signal = {**self.short, "pump_base": 70, "pump_target": 73,
-                  "route_pct": 27, "reward_risk": 5.4}
+                  "main_target": 79.9, "route_pct": 20.1,
+                  "base_route_pct": 27, "reward_risk": 4}
         record = record_alert(signal, {}, self.sent, "new")
-        self.assertEqual(record["target_scheme"], "pump_base_90")
-        self.assertEqual(record["targets"], [73])
+        self.assertEqual(record["target_scheme"], "price_drop_20")
+        self.assertEqual(record["targets"], [79.9])
         self.assertEqual(record["end_ms"] - record["first_full_bar_ms"],
                          72 * 3_600_000)
         first = record["first_full_bar_ms"]
         apply_bar(record, Bar(first, 100, 104, 95, 98, 100))
-        apply_bar(record, Bar(first + FIVE_MINUTES, 98, 103, 73, 76, 100))
+        apply_bar(record, Bar(first + FIVE_MINUTES, 98, 103, 79.9, 82, 100))
         self.assertEqual(outcome(record), "tp_first")
         old = record_alert(self.short, {}, self.sent, "old")
         for row in (record, old):
             row["status"] = "complete"
         summary = summarize([record, old])
-        self.assertEqual(summary["by_scheme"]["pump_base_90"]["tp_first"], 1)
+        self.assertEqual(summary["by_scheme"]["price_drop_20"]["tp_first"], 1)
         self.assertEqual(summary["by_scheme"]["risk_multiple"]["n"], 1)
+        digest = render_digest({"since_ms": self.sent, "until_ms": self.sent + 72 * 3_600_000,
+                                "summary": summary, "complete_total": 2, "pending": 0,
+                                "data_gaps": 0, "detail_complete": True, "patterns": []})
+        self.assertIn("снижение цены ≥20%", digest)
+        self.assertIn("прежняя цель 1R", digest)
+        previous_structural = record_alert({**self.short, "pump_target": 73}, {},
+                                           self.sent, "previous")
+        self.assertEqual(previous_structural["target_scheme"], "pump_base_90")
+        self.assertEqual(previous_structural["targets"], [73])
+        with self.assertRaisesRegex(ValueError, "at least 20%"):
+            record_alert({**signal, "main_target": 81}, {}, self.sent, "bad")
 
     def test_long_uses_opposite_price_direction(self):
         signal = {"stage": "momentum_confirmed", "symbol": "TEST-USDT",

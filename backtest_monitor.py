@@ -64,6 +64,9 @@ def replay_symbol(symbol: str, client: BingX, spread_assumption_pct: float = 0.2
             continue
         if not signal["entry"] * 0.98 <= entry <= signal["entry"] * 1.01:
             continue
+        if (signal["pump_target"] > entry * 0.8 or signal["stop"] <= entry or
+                (entry * 0.2) / (signal["stop"] - entry) < 2.5):
+            continue
         if len(future) < 864:
             reversal_events.append({"utc": signal["observed_utc"],
                                     "entry_next_open": entry, "pump_pct": signal["pump_pct"],
@@ -81,16 +84,20 @@ def replay_symbol(symbol: str, client: BingX, spread_assumption_pct: float = 0.2
         min_low = min(bar.low for bar in future)
         max_high = max(bar.high for bar in future)
         stop = signal["stop"] if signal["actionable"] else entry * 1.08
-        stopped_first = False
+        stop_before_20 = False
+        stop_before_base = False
         hit20 = False
         hit30 = False
         hit_base = False
+        same_bar_20 = False
         same_bar_base = False
         for bar in future:
             base_here = bar.low <= signal["pump_target"]
             if bar.high >= stop:
-                same_bar_base = base_here
-                stopped_first = True
+                same_bar_20 = not hit20 and bar.low <= entry * 0.8
+                same_bar_base = not hit_base and base_here
+                stop_before_20 = not hit20 and not same_bar_20
+                stop_before_base = not hit_base and not same_bar_base
                 break
             if bar.low <= entry * 0.7:
                 hit30 = True
@@ -109,8 +116,10 @@ def replay_symbol(symbol: str, client: BingX, spread_assumption_pct: float = 0.2
             "max_adverse_72h_pct": round(100 * (max_high / entry - 1), 1),
             "hit20_before_stop": hit20, "hit30_before_stop": hit30,
             "hit_base_before_stop": hit_base, "same_bar_base": same_bar_base,
+            "same_bar_20": same_bar_20,
             "pump_base_target": signal["pump_target"],
-            "stop_first": stopped_first,
+            "stop_before_20": stop_before_20,
+            "stop_before_base": stop_before_base,
             "outcome_complete": True,
         })
     return {"symbol": symbol, "late_events": late_events,
@@ -161,10 +170,12 @@ def main() -> int:
         "reversal_events_data_gaps": sum(event.get("data_gap", False) for event in events),
         "actionable_events": sum(event["actionable"] for event in completed),
         "hit20_before_stop": sum(event["hit20_before_stop"] for event in completed),
+        "same_bar_20": sum(event["same_bar_20"] for event in completed),
+        "stop_before_20": sum(event["stop_before_20"] for event in completed),
         "hit30_before_stop": sum(event["hit30_before_stop"] for event in completed),
         "hit_base_before_stop_72h": sum(event["hit_base_before_stop"] for event in completed),
         "same_bar_base_72h": sum(event["same_bar_base"] for event in completed),
-        "stop_first": sum(event["stop_first"] for event in completed),
+        "stop_before_base_72h": sum(event["stop_before_base"] for event in completed),
         "median_max_favorable_72h_pct": statistics.median(
             [event["max_favorable_72h_pct"] for event in completed]) if completed else None,
         "median_max_adverse_72h_pct": statistics.median(
