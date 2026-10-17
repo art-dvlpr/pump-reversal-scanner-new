@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from monitor import FIVE_MINUTES, Bar, closed_bars, number, utc
 
 HORIZON_MS = 24 * 3_600_000
+PUMP_BASE_HORIZON_MS = 72 * 3_600_000
 REPORT_EVERY = 100
 MAX_RECORDS = 300
 DIGEST_INTERVAL_MS = 3 * 24 * 3_600_000
@@ -36,6 +37,12 @@ def record_alert(signal: dict, context: dict, sent_at_ms: int,
         raise ValueError("Invalid entry or stop for outcome tracking")
     direction = -1 if side == "short" else 1
     start_ms = ((sent_at_ms + FIVE_MINUTES - 1) // FIVE_MINUTES) * FIVE_MINUTES
+    structural = side == "short" and signal.get("pump_target") is not None
+    target = number(signal.get("pump_target")) if structural else None
+    if structural and not 0 < target < entry:
+        raise ValueError("Invalid pump-base target for outcome tracking")
+    targets = [target] if structural else [entry + direction * risk * multiple
+                                           for multiple in (1, 1.5, 2)]
     funding = context.get("funding") or {}
     flow = context.get("flow") or {}
     return {
@@ -43,11 +50,17 @@ def record_alert(signal: dict, context: dict, sent_at_ms: int,
         "symbol": signal["symbol"], "side": side,
         "strategy_version": strategy_version,
         "sent_at_ms": sent_at_ms, "first_full_bar_ms": start_ms,
-        "next_bar_ms": start_ms, "end_ms": start_ms + HORIZON_MS,
+        "next_bar_ms": start_ms, "end_ms": start_ms + (
+            PUMP_BASE_HORIZON_MS if structural else HORIZON_MS),
         "entry": entry, "stop": stop,
-        "targets": [entry + direction * risk * multiple for multiple in (1, 1.5, 2)],
+        "targets": targets,
+        "target_scheme": "pump_base_90" if structural else "risk_multiple",
         "features": {
             "pump_pct": signal.get("pump_pct"),
+            "pump_base": signal.get("pump_base"),
+            "pump_target": signal.get("pump_target"),
+            "route_pct": signal.get("route_pct"),
+            "reward_risk": signal.get("reward_risk"),
             "retrace_pct": signal.get("retrace_pct"),
             "rebound3h_pct": signal.get("rebound3h_pct"),
             "old_peak_multiple": signal.get("old_peak_multiple"),
@@ -66,7 +79,7 @@ def record_alert(signal: dict, context: dict, sent_at_ms: int,
             "trade_delta_pct": flow.get("delta_pct") if flow.get("complete_5m") else None,
         },
         "status": "pending", "first_sl_ms": None,
-        "first_tp_ms": [None, None, None],
+        "first_tp_ms": [None] * len(targets),
         "max_favorable_pct": 0.0, "max_adverse_pct": 0.0,
     }
 
@@ -197,20 +210,31 @@ def summarize(records: list[dict]) -> dict:
                for side in ("short", "long")}
     by_version = {version: _counts([row for row in completed if row.get("strategy_version") == version])
                   for version in sorted({row.get("strategy_version", "unknown") for row in completed})}
+    by_scheme = {scheme: _counts([row for row in completed if
+                                  row.get("target_scheme", "risk_multiple") == scheme])
+                 for scheme in sorted({row.get("target_scheme", "risk_multiple")
+                                       for row in completed})}
+    by_side_scheme = {
+        f"{side}:{scheme}": _counts([row for row in completed if row["side"] == side and
+                                      row.get("target_scheme", "risk_multiple") == scheme])
+        for scheme in by_scheme for side in ("short", "long")}
     factors = {}
-    for side, fields in FACTOR_EDGES.items():
-        for field, edges in fields.items():
-            grouped: dict[str, list[dict]] = defaultdict(list)
-            for row in completed:
-                if row["side"] != side:
-                    continue
-                label = _bucket(row.get("features", {}).get(field), edges)
-                if label is not None:
-                    grouped[label].append(row)
-            factors[f"{side}:{field}"] = {label: _counts(group)
-                                          for label, group in grouped.items() if len(group) >= 10}
+    for scheme in by_scheme:
+        for side, fields in FACTOR_EDGES.items():
+            for field, edges in fields.items():
+                grouped: dict[str, list[dict]] = defaultdict(list)
+                for row in completed:
+                    if (row["side"] != side or
+                            row.get("target_scheme", "risk_multiple") != scheme):
+                        continue
+                    label = _bucket(row.get("features", {}).get(field), edges)
+                    if label is not None:
+                        grouped[label].append(row)
+                factors[f"{scheme}:{side}:{field}"] = {label: _counts(group)
+                    for label, group in grouped.items() if len(group) >= 10}
     return {"sample_count": len(completed), "overall": _counts(completed),
-            "by_side": by_side, "by_version": by_version, "factors": factors}
+            "by_side": by_side, "by_version": by_version,
+            "by_scheme": by_scheme, "by_side_scheme": by_side_scheme, "factors": factors}
 
 
 def recurring_patterns(records: list[dict]) -> list[dict]:
@@ -222,7 +246,9 @@ def recurring_patterns(records: list[dict]) -> list[dict]:
         if not side_rows:
             continue
         version = side_rows[-1].get("strategy_version", "unknown")
-        side_rows = [row for row in side_rows if row.get("strategy_version", "unknown") == version]
+        scheme = side_rows[-1].get("target_scheme", "risk_multiple")
+        side_rows = [row for row in side_rows if row.get("strategy_version", "unknown") == version
+                     and row.get("target_scheme", "risk_multiple") == scheme]
         if len(side_rows) < 80:
             continue
         midpoint = len(side_rows) // 2
@@ -301,11 +327,20 @@ def render_digest(report: dict) -> str:
              f"🕒 {msk(report['since_ms'])} — {msk(report['until_ms'])} МСК",
              "━━━━━━━━━━━━━━━━━━",
              f"✅ Завершено за период: <b>{report['complete_total']}</b>"]
-    for side, label in (("short", "🔴 SHORT"), ("long", "🟢 LONG")):
-        row = summary["by_side"][side]
-        lines.append(f"{label}: {row['n']} · TP1→SL: {row['tp_first']} · "
-                     f"SL→TP1: {row['sl_first']} · в одной свече: {row['same_bar']} · "
-                     f"без касания: {row['neither']}")
+    structural = summary.get("by_scheme", {}).get("pump_base_90")
+    if structural:
+        lines.append(f"🔴 Новые SHORT · цель у основания пампа, 72ч: {structural['n']} · "
+                     f"цель раньше отмены: {structural['tp_first']} · "
+                     f"отмена раньше цели: {structural['sl_first']} · "
+                     f"в одной свече: {structural['same_bar']} · "
+                     f"без касания: {structural['neither']}")
+    for side, label in (("short", "🔴"), ("long", "🟢")):
+        legacy = summary.get("by_side_scheme", {}).get(f"{side}:risk_multiple")
+        if legacy and legacy["n"]:
+            lines.append(f"{label} Ранее отправленные {side.upper()} · прежняя цель 1R, 24ч: "
+                         f"{legacy['n']} · TP1→SL: {legacy['tp_first']} · "
+                         f"SL→TP1: {legacy['sl_first']} · в одной свече: "
+                         f"{legacy['same_bar']} · без касания: {legacy['neither']}")
     lines.extend([f"⏳ Ещё проверяются: {report['pending']} · "
                   f"⚠️ Пробелы данных: {report['data_gaps']}",
                   "━━━━━━━━━━━━━━━━━━"])
@@ -314,15 +349,15 @@ def render_digest(report: dict) -> str:
     if report["patterns"]:
         for pattern in report["patterns"]:
             label = "лучше" if pattern["direction"] == "stronger" else "хуже"
-            lines.append(f"🔎 Гипотеза: {pattern['side'].upper()} · "
+            lines.append(f"🔎 Гипотеза по последней версии: {pattern['side'].upper()} · "
                          f"{FEATURE_LABELS[pattern['feature']]} {pattern['bucket']} — "
-                         f"TP1 раньше SL {label} в двух выборках "
+                         f"цель раньше отмены {label} в двух выборках "
                          f"(n={pattern['group_n']}).")
         lines.append("Правила входа по этой сводке автоматически не менялись: "
                      "нужна проверка издержек и новых данных.")
     else:
         lines.append("🔎 Устойчивых повторяющихся признаков для пересмотра правил пока нет.")
-    lines.append("Исходы расчётных уровней за 24ч по свечам, не твои сделки и не PnL; "
+    lines.append("Исходы расчётных уровней по свечам, не твои сделки и не PnL; "
                  "без комиссий, funding и проскальзывания.")
     return "\n".join(lines)
 
@@ -346,14 +381,19 @@ def prepare_milestone_report(state: dict, now_ms: int) -> dict | None:
 def render_report(report: dict) -> str:
     summary = report["summary"]
     lines = [f"# Проверка {summary['sample_count']} сигналов · рубеж {report['milestone']}",
-             f"Создано: {report['generated_utc']} · горизонт: 24 часа после первого полного 5м бара.",
+             f"Создано: {report['generated_utc']} · новая цель у основания: 72ч; старые цели 1R: 24ч.",
              "Это исходы сигналов по свечам, не фактические сделки пользователя. "
              "Учтена цена последней сделки, без комиссий, funding и проскальзывания.",
              f"Исключено из статистики из-за пробелов данных: {report.get('data_gap_total', 0)}.", ""]
-    for side, label in (("short", "🔴 SHORT"), ("long", "🟢 LONG")):
-        row = summary["by_side"][side]
-        lines.append(f"{label}: {row['n']} · TP1 раньше SL: {row['tp_first']} · "
-                     f"SL раньше TP1: {row['sl_first']} · в одной свече: {row['same_bar']} · "
+    groups = (("short:pump_base_90", "🔴 Новые SHORT · цель у основания"),
+              ("short:risk_multiple", "🔴 Ранее отправленные SHORT · старая цель 1R"),
+              ("long:risk_multiple", "🟢 Ранее отправленные LONG · старая цель 1R"))
+    for group, label in groups:
+        row = summary.get("by_side_scheme", {}).get(group)
+        if not row:
+            continue
+        lines.append(f"{label}: {row['n']} · цель раньше SL: {row['tp_first']} · "
+                     f"SL раньше цели: {row['sl_first']} · в одной свече: {row['same_bar']} · "
                      f"ни один уровень: {row['neither']}.")
         if row["n"]:
             lines.append(f"Медиана MFE/MAE: {row['median_favorable_pct']}% / "

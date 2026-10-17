@@ -9,7 +9,8 @@ from unittest.mock import Mock, patch
 
 import run_monitor
 from monitor import (Bar, Ticker, candidates, confirm_momentum, evaluate,
-                     evaluate_momentum, old_peak, updated_price_snapshots)
+                     evaluate_momentum, old_peak, prior_daily_peak,
+                     scan_market, updated_price_snapshots)
 from run_monitor import book_slippage_pct, mark_sent, message, refresh_entry, select_alerts
 from state_store import LocalStateStore
 
@@ -59,6 +60,12 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(result["stage"], "reversal")
         self.assertEqual(result["reversal_type"], "пробой опоры")
         self.assertLess(result["retrace_pct"], 25)
+        self.assertTrue(result["actionable"])
+        self.assertAlmostEqual(result["pump_base"], 0.1)
+        self.assertLess(result["pump_base"], result["pump_target"])
+        self.assertLess(result["pump_target"], result["entry"])
+        self.assertGreaterEqual(result["route_pct"], 20)
+        self.assertIn("цель", message(result))
 
     def test_forming_candle_cannot_create_signal(self):
         bars = sample_bars(self.now)
@@ -67,18 +74,66 @@ class MonitorTests(unittest.TestCase):
         result = evaluate(self.ticker, bars, self.now, 2.16)
         self.assertEqual(result["stage"], "watch")
 
+    def test_single_low_wick_does_not_move_pump_base(self):
+        bars = sample_bars(self.now)
+        old = bars[7]
+        bars[7] = Bar(old.start_ms, old.open, old.high, 0.001, old.close, old.volume)
+        last = bars[-1]
+        bars[-1] = Bar(last.start_ms, 0.145, 0.146, 0.138, 0.139, 180)
+        ticker = Ticker("VELVET-USDT", 0.139, 0.152, 0.001,
+                        1_000_000, 0.1389, 0.1391)
+        result = evaluate(ticker, bars, self.now, 2.16)
+        self.assertAlmostEqual(result["pump_base"], 0.1)
+
+    def test_late_retrace_is_not_an_entry(self):
+        bars = sample_bars(self.now)
+        last = bars[-1]
+        bars[-1] = Bar(last.start_ms, 0.145, 0.146, 0.125, 0.126, 180)
+        ticker = Ticker("VELVET-USDT", 0.126, 0.152, 0.1,
+                        1_000_000, 0.1259, 0.1261)
+        result = evaluate(ticker, bars, self.now, 2.16)
+        self.assertFalse(result["actionable"])
+        self.assertEqual(select_alerts([result], {"episodes": {}}, self.now), [])
+
     def test_old_monthly_peak_excludes_current_month(self):
         month_start = 1_798_761_600_000
         history = [Bar(month_start - 40 * 86_400_000, 1, 2.16, 0.08, 0.1, 1),
                    Bar(month_start, 0.1, 9, 0.1, 0.2, 1)]
         self.assertEqual(old_peak(history, month_start + 3 * 86_400_000), 2.16)
 
+    def test_young_listing_prior_peak_excludes_current_pump(self):
+        day = 86_400_000
+        history = [Bar(self.now - 10 * day, 1, 8, 0.1, 0.2, 1),
+                   Bar(self.now - day, 0.2, 12, 0.1, 0.2, 1)]
+        self.assertEqual(prior_daily_peak(history, self.now), 8)
+
+    def test_live_scan_uses_daily_peak_for_young_degraded_coin(self):
+        bars = sample_bars(self.now)
+        last = bars[-1]
+        bars[-1] = Bar(last.start_ms, 0.145, 0.146, 0.138, 0.139, 180)
+        ticker = Ticker("VELVET-USDT", 0.139, 0.152, 0.1,
+                        1_000_000, 0.1389, 0.1391)
+        client = Mock()
+        client.tickers.return_value = [ticker]
+        client.contracts.return_value = {ticker.symbol}
+        client.price_precisions = {ticker.symbol: 6}
+        client.bars.side_effect = lambda _, interval, __: (
+            bars if interval == "5m" else
+            [Bar(self.now - 10 * 86_400_000, 1, 2.16, 0.1, 0.2, 1)]
+            if interval == "1d" else [])
+        signals, _ = scan_market(client, self.now, {}, include_momentum=False)
+        self.assertEqual(len(signals), 1)
+        self.assertTrue(signals[0]["actionable"])
+        self.assertGreater(signals[0]["old_peak_multiple"], 3)
+        client.open_interest.assert_not_called()
+
     def test_alert_state_deduplicates_same_episode(self):
         signal = {"symbol": "VELVET-USDT", "stage": "reversal", "actionable": True,
                   "peak_ms": self.now - FIVE,
                   "peak": 0.152, "pump_pct": 50, "retrace_pct": 3,
                   "old_peak_multiple": 15, "event_ms": self.now - FIVE,
-                  "rebound3h_pct": 50}
+                  "rebound3h_pct": 50, "route_pct": 25,
+                  "reward_risk": 3, "pump_target": 0.105}
         state = {"episodes": {}}
         alerts = select_alerts([signal], state, self.now)
         self.assertEqual(len(alerts), 1)
@@ -103,9 +158,8 @@ class MonitorTests(unittest.TestCase):
         long_entry = {**long_watch, "stage": "momentum_confirmed", "actionable": True}
         state = {"episodes": {}}
         alerts = select_alerts([short, long_watch, long_entry], state, self.now)
-        self.assertEqual(alerts, [long_entry])
-        self.assertEqual(list(state["episodes"]), ["VELVET-USDT#momentum"])
-        mark_sent(long_entry, state)
+        self.assertEqual(alerts, [])
+        self.assertEqual(state["episodes"], {})
         self.assertEqual(select_alerts([short, long_watch, long_entry], state, self.now), [])
 
     def test_local_state_survives_new_run(self):
@@ -148,13 +202,8 @@ class MonitorTests(unittest.TestCase):
                                   {"value": 100, "at_ms": self.now - FIVE}, self.now)
         self.assertEqual(seeded["stage"], "momentum_watch")
         self.assertTrue(confirmed["target1"] > confirmed["entry"] > confirmed["stop"])
-        rendered = message(confirmed)
-        self.assertIn("🟢 #LONG", rendered)
-        self.assertIn("TP1", rendered)
-        self.assertIn("TP2", rendered)
-        self.assertIn("TP3", rendered)
-        self.assertIn("SL", rendered)
-        self.assertIn("━━━━━━━━", rendered)
+        with self.assertRaisesRegex(ValueError, "Long alerts are disabled"):
+            message(confirmed)
 
     def test_early_growth_seeds_oi_without_sending_entry(self):
         bars = [Bar(self.now - (40 - index) * FIVE, 1, 1.001, 0.999, 1, 100)
@@ -180,7 +229,8 @@ class MonitorTests(unittest.TestCase):
     def test_entry_refresh_rejects_price_drift_and_thin_book(self):
         signal = {"symbol": "VELVET-USDT", "stage": "reversal", "actionable": True,
                   "event_ms": self.now - FIVE, "entry": 0.147, "stop": 0.155,
-                  "historical_high": 2.16, "price": 0.147}
+                  "historical_high": 2.16, "price": 0.147,
+                  "pump_target": 0.105}
         book = {"T": self.now, "bids": [["0.1469", "10000"]],
                 "asks": [["0.1471", "10000"]]}
         ticker = Ticker("VELVET-USDT", 0.147, 0.16, 0.1,
@@ -215,7 +265,7 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(confirmed.get("actionable", False))
         self.assertIsNone(confirmed["oi_change_pct"])
 
-    def test_main_processes_confirmed_long_without_crashing(self):
+    def test_main_keeps_long_disabled(self):
         now_ms = int(run_monitor.time.time() * 1000)
         signal = {"symbol": "TEST-USDT", "stage": "momentum_confirmed",
                   "actionable": True, "entry": 100, "stop": 95,
@@ -232,7 +282,7 @@ class MonitorTests(unittest.TestCase):
         with (patch.object(run_monitor, "configured_store", return_value=store),
               patch.object(run_monitor, "BingX", return_value=client),
               patch.object(run_monitor, "scan_market", return_value=([signal], coverage)),
-              patch.object(run_monitor, "select_alerts", return_value=[signal]),
+              patch.object(run_monitor, "select_alerts", return_value=[]),
               patch.object(run_monitor, "refresh_entry", return_value=signal),
               patch.object(run_monitor, "message", return_value="entry"),
               patch.object(run_monitor, "mark_sent"),
@@ -241,7 +291,7 @@ class MonitorTests(unittest.TestCase):
               patch.object(run_monitor, "telegram_send", return_value=42) as send,
               patch.object(run_monitor.sys, "argv", ["run_monitor.py"])):
             self.assertEqual(run_monitor.main(), 0)
-        send.assert_called_once_with("token", "chat", "entry")
+        send.assert_not_called()
         store.save.assert_called_once()
 
 

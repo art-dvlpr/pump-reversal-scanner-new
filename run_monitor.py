@@ -13,7 +13,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from monitor import BingX, FIVE_MINUTES, number, scan_market, utc
+from monitor import (BingX, FIVE_MINUTES, SHORT_MAX_RETRACE_PCT,
+                     SHORT_MAX_RISK_PCT, SHORT_MIN_OLD_PEAK_MULTIPLE,
+                     SHORT_MIN_PUMP_PCT, SHORT_MIN_REWARD_RISK,
+                     SHORT_MIN_ROUTE_PCT, number, scan_market, utc)
 from performance import (advance_evaluations, mark_digest_sent, prepare_digest,
                          prepare_milestone_report, record_alert, render_digest)
 from state_store import configured_store
@@ -78,15 +81,15 @@ def episode_for(signal: dict, episodes: dict, now_ms: int) -> dict:
 def should_send(signal: dict, episode: dict, now_ms: int) -> bool:
     if not signal.get("actionable"):
         return False
-    if signal["stage"] == "momentum_confirmed":
-        return (not episode["confirmed_sent"] and
-                0 <= now_ms - signal["event_ms"] <= 20 * 60_000)
     if signal["stage"] != "reversal":
         return False
-    profile = (signal.get("old_peak_multiple") is not None and
-               signal["old_peak_multiple"] >= 2)
     return (not episode["reversal_sent"] and
-            (profile or signal["pump_pct"] >= 40) and
+            (signal.get("old_peak_multiple") or 0) >= SHORT_MIN_OLD_PEAK_MULTIPLE and
+            signal.get("pump_pct", 0) >= SHORT_MIN_PUMP_PCT and
+            signal.get("retrace_pct", 100) <= SHORT_MAX_RETRACE_PCT and
+            signal.get("route_pct", 0) >= SHORT_MIN_ROUTE_PCT and
+            signal.get("reward_risk", 0) >= SHORT_MIN_REWARD_RISK and
+            signal.get("pump_target", 0) > 0 and
             0 <= now_ms - signal["event_ms"] <= 25 * 60_000)
 
 
@@ -122,7 +125,7 @@ def message(signal: dict, context: dict | None = None) -> str:
                       signal.get("oi_change_pct") is not None else
                       "🧲 OI: ждём второго замера"])
     else:
-        lines.extend([f"🚀 Памп: +{signal['pump_pct']}% от локального минимума",
+        lines.extend([f"🚀 Памп: +{signal['pump_pct']}% от основания",
                       f"↘️ Откат: {signal['retrace_pct']}% от пика {price(signal['peak'])}"])
         if signal.get("old_peak_multiple"):
             lines.append(f"🕰 Старый пик: {signal['old_peak_multiple']}× текущей цены")
@@ -130,17 +133,17 @@ def message(signal: dict, context: dict | None = None) -> str:
             lines.append(f"📉 Признак: {html.escape(signal['reversal_type'])}")
     lines.append("━━━━━━━━━━━━━━━━━━")
     entry, stop = signal["entry"], signal["stop"]
-    unit = abs(entry - stop)
-    direction = 1 if momentum else -1
-    targets = [entry + direction * unit * multiple for multiple in (1, 1.5, 2)]
-    lines.extend([f"🔹 <b>Точка входа:</b> около {price(entry)} USDT",
-                  "🎯 <b>Расчётные цели (Take-Profit):</b>",
-                  f"   TP1 · {price(targets[0])} USDT (1R)",
-                  f"   TP2 · {price(targets[1])} USDT (1,5R)",
-                  f"   TP3 · {price(targets[2])} USDT (2R)",
-                  f"🔴 <b>Стоп-лосс (SL) / отмена:</b> {price(stop)} USDT",
-                  f"⚠️ Риск до стопа: {signal['risk_pct']}% цены. "
-                  "Размер позиции рассчитай вручную; ориентир — риск до 2% капитала."])
+    if momentum:
+        raise ValueError("Long alerts are disabled")
+    lines.extend([f"🔹 <b>Условный вход:</b> около {price(entry)} USDT",
+                  f"🎯 <b>Главная цель:</b> {price(signal['pump_target'])} USDT "
+                  f"(почти у основания пампа {price(signal['pump_base'])})",
+                  f"📏 Потенциал до цели: {signal['route_pct']}% цены · "
+                  f"цель/риск: {signal['reward_risk']}R",
+                  f"🛑 <b>Отмена сценария:</b> {price(stop)} USDT "
+                  "(обновление пика)",
+                  f"⚠️ До отмены: {signal['risk_pct']}% цены. "
+                  "Размер позиции и решение о входе — вручную."])
     lines.extend(["━━━━━━━━━━━━━━━━━━",
                   f"💧 Оборот 24ч: {signal['turnover_usdt']:,} USDT · спред: {signal['spread_pct']}%"])
     if signal.get("book_slippage_pct") is not None:
@@ -165,12 +168,8 @@ def message(signal: dict, context: dict | None = None) -> str:
 def select_alerts(signals: list[dict], state: dict, now_ms: int) -> list[dict]:
     episodes = state.setdefault("episodes", {})
     ready: list[dict] = []
-    eligible = [item for item in signals if item.get("actionable") and
-                item["stage"] in ("reversal", "momentum_confirmed")]
-    confirmed_reversals = {item["symbol"] for item in eligible if item["stage"] == "reversal"}
-    for signal in sorted(eligible, key=lambda item: -item.get("pump_pct", item.get("gain15_pct", 0))):
-        if signal["stage"].startswith("momentum_") and signal["symbol"] in confirmed_reversals:
-            continue
+    eligible = [item for item in signals if item.get("actionable") and item["stage"] == "reversal"]
+    for signal in sorted(eligible, key=lambda item: -item.get("route_pct", 0)):
         episode = episode_for(signal, episodes, now_ms)
         if should_send(signal, episode, now_ms):
             ready.append(signal)
@@ -259,11 +258,17 @@ def refresh_entry(signal: dict, ticker, book: dict, now_ms: int) -> dict:
         if not signal["entry"] * 0.98 <= ticker.price <= signal["entry"] * 1.01:
             raise ValueError("price left short entry zone")
         risk = 100 * (signal["stop"] / ticker.price - 1)
-        if not 0 < risk <= 8:
+        if not 0 < risk <= SHORT_MAX_RISK_PCT:
             raise ValueError("short stop distance no longer valid")
         latest["entry"] = ticker.price
         latest["risk_pct"] = round(risk, 2)
-        latest["target1"] = ticker.price - 1.5 * (signal["stop"] - ticker.price)
+        latest["target1"] = signal["pump_target"]
+        latest["route_pct"] = round(100 * (1 - signal["pump_target"] / ticker.price), 1)
+        latest["reward_risk"] = round((ticker.price - signal["pump_target"]) /
+                                      (signal["stop"] - ticker.price), 1)
+        if (latest["route_pct"] < SHORT_MIN_ROUTE_PCT or
+                latest["reward_risk"] < SHORT_MIN_REWARD_RISK):
+            raise ValueError("pump-base route no longer large enough")
         if latest.get("historical_high"):
             latest["old_peak_multiple"] = round(latest["historical_high"] / ticker.price, 1)
     return latest
@@ -287,7 +292,7 @@ def main() -> int:
     client = BingX()
     signals, coverage = scan_market(client, now_ms, state.get("history", {}),
                                     state.get("price_snapshots", {}),
-                                    state.get("oi_snapshots", {}))
+                                    state.get("oi_snapshots", {}), include_momentum=False)
     state.setdefault("history", {}).update(coverage.pop("history_updates"))
     state["price_snapshots"] = coverage.pop("price_updates")
     oi_updates = coverage.pop("oi_updates")
@@ -297,8 +302,6 @@ def main() -> int:
     if coverage["deep_count"] == 0 or len(coverage["errors"]) >= max(5, coverage["deep_count"] // 5):
         raise RuntimeError("BingX data coverage failed; no alerts sent: " +
                            "; ".join(coverage["errors"][:5]))
-    if coverage["momentum_count"] and coverage["oi_failures"] == coverage["momentum_count"]:
-        raise RuntimeError("BingX open interest unavailable for all momentum candidates")
     alerts = select_alerts(signals, state, int(time.time() * 1000))
     if args.dry_run:
         checked = []

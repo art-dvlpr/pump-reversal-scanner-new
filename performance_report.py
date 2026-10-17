@@ -33,7 +33,7 @@ def main() -> int:
         completed = [row for row in data.get("evaluations", [])
                      if row.get("status") == "complete"]
         if not completed:
-            print("Завершённых 24-часовых наблюдений пока нет. "
+            print("Завершённых наблюдений пока нет. "
                   f"Открытых: {sum(row.get('status') == 'pending' for row in data.get('evaluations', []))}.")
         else:
             report = {"milestone": data.get("next_report_at", 100),

@@ -22,6 +22,12 @@ FIVE_MINUTES = 300_000
 DAY = 86_400_000
 PINNED = {"VELVET-USDT", "BAT-USDT"}
 USER_AGENT = "BingX-public-market-research/2.0"
+SHORT_MIN_OLD_PEAK_MULTIPLE = 3
+SHORT_MIN_PUMP_PCT = 40
+SHORT_MAX_RETRACE_PCT = 12
+SHORT_MIN_ROUTE_PCT = 20
+SHORT_MIN_REWARD_RISK = 2.5
+SHORT_MAX_RISK_PCT = 12
 
 
 def utc(ms: int) -> str:
@@ -137,8 +143,12 @@ class BingX:
         return {str(row.get("symbol")) for row in rows
                 if row.get("status") == 1 and str(row.get("apiStateOpen", "")).lower() == "true"}
 
-    def bars(self, symbol: str, interval: str, limit: int) -> list["Bar"]:
-        rows = self.get("/openApi/swap/v3/quote/klines", symbol=symbol, interval=interval, limit=limit)
+    def bars(self, symbol: str, interval: str, limit: int,
+             end_ms: int | None = None) -> list["Bar"]:
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        if end_ms is not None:
+            params["endTime"] = end_ms
+        rows = self.get("/openApi/swap/v3/quote/klines", **params)
         if not isinstance(rows, list):
             raise ValueError(f"BingX {symbol} {interval} candles unavailable")
         bars = [Bar(int(row["time"]), number(row.get("open")), number(row.get("high")),
@@ -224,6 +234,12 @@ def old_peak(monthly: list[Bar], now_ms: int) -> float | None:
     return max(eligible) if eligible else None
 
 
+def prior_daily_peak(daily: list[Bar], now_ms: int) -> float | None:
+    """Include young listings while excluding the current seven-day pump cycle."""
+    eligible = [bar.high for bar in daily if bar.start_ms < now_ms - 7 * DAY and bar.high > 0]
+    return max(eligible) if eligible else None
+
+
 def evaluate(ticker: Ticker, bars: list[Bar], now_ms: int,
              historical_high: float | None = None) -> dict | None:
     """Return an observation from data known at now_ms; never inspect future bars."""
@@ -240,8 +256,10 @@ def evaluate(ticker: Ticker, bars: list[Bar], now_ms: int,
     before = recent[max(0, peak_index - 144):peak_index + 1]
     if peak_index < 3 or len(before) < 4:
         return None
-    trough = min(bar.low for bar in before)
-    pump_pct = 100 * (peak.high / trough - 1)
+    # A three-close median resists a single bad low wick at the pump origin.
+    base = min(statistics.median(bar.close for bar in before[index:index + 3])
+               for index in range(len(before) - 2))
+    pump_pct = 100 * (peak.high / base - 1) if base > 0 else 0
     recent_trough = min(bar.low for bar in recent[max(0, peak_index - 36):peak_index + 1])
     rebound3h_pct = 100 * (peak.high / recent_trough - 1)
     retrace_pct = 100 * (1 - closed[-1].close / peak.high)
@@ -286,22 +304,32 @@ def evaluate(ticker: Ticker, bars: list[Bar], now_ms: int,
     if ticker.turnover_usdt < 50_000 or ticker.spread_pct > 1.5:
         return None
     actionable = ticker.turnover_usdt >= 300_000 and ticker.spread_pct <= 0.5
-    level = previous_low if breakdown else event.low
+    level = min(previous_low, last.close) if breakdown else event.low
     entry = level
-    stop = max(bar.high for bar in closed[-7:]) * 1.005
+    # A renewed peak invalidates the near-top reversal thesis.
+    stop = peak.high * 1.005
     risk_pct = 100 * (stop / entry - 1) if entry > 0 else math.inf
-    actionable = (actionable and stage == "reversal" and 0 < risk_pct <= 8 and
+    target = base + 0.1 * (peak.high - base)
+    route_pct = 100 * (1 - target / entry) if entry > 0 else 0
+    reward_risk = (entry - target) / (stop - entry) if stop > entry else 0
+    old_multiple = historical_high / ticker.price if historical_high else 0
+    actionable = (actionable and stage == "reversal" and
+                  old_multiple >= SHORT_MIN_OLD_PEAK_MULTIPLE and
+                  pump_pct >= SHORT_MIN_PUMP_PCT and
+                  retrace_pct <= SHORT_MAX_RETRACE_PCT and
+                  route_pct >= SHORT_MIN_ROUTE_PCT and
+                  reward_risk >= SHORT_MIN_REWARD_RISK and
+                  0 < risk_pct <= SHORT_MAX_RISK_PCT and
                   ticker.price >= entry * 0.98 and ticker.price <= entry * 1.01)
-    target1 = entry - 1.5 * (stop - entry) if actionable else None
-    if target1 is not None and target1 <= 0:
-        actionable = False
-        target1 = None
+    target1 = target if actionable else None
     return {
         "exchange": "BingX", "symbol": ticker.symbol, "stage": stage,
         "observed_utc": utc(now_ms), "last_closed_utc": utc(last.start_ms + FIVE_MINUTES),
         "event_utc": utc(event.start_ms + FIVE_MINUTES), "event_ms": event.start_ms,
         "peak_utc": utc(peak.start_ms), "peak_ms": peak.start_ms,
-        "peak": peak.high, "price": ticker.price, "pump_pct": round(pump_pct, 1),
+        "peak": peak.high, "pump_base": base, "pump_target": target,
+        "route_pct": round(route_pct, 1), "reward_risk": round(reward_risk, 1),
+        "price": ticker.price, "pump_pct": round(pump_pct, 1),
         "rebound3h_pct": round(rebound3h_pct, 1),
         "retrace_pct": round(retrace_pct, 1), "range24_pct": round(ticker.range_pct, 1),
         "turnover_usdt": round(ticker.turnover_usdt), "spread_pct": round(ticker.spread_pct, 3),
@@ -436,7 +464,8 @@ def updated_price_snapshots(tickers: list[Ticker], tradable: set[str],
 
 def scan_market(client: BingX, now_ms: int, history: dict,
                 price_snapshots: dict | None = None,
-                oi_snapshots: dict | None = None) -> tuple[list[dict], dict]:
+                oi_snapshots: dict | None = None,
+                include_momentum: bool = True) -> tuple[list[dict], dict]:
     tickers = client.tickers()
     tradable = client.contracts()
     selected = candidates(tickers, tradable, price_snapshots, now_ms)
@@ -453,11 +482,21 @@ def scan_market(client: BingX, now_ms: int, history: dict,
         update = None
         high = old.get("high") if old else None
         result = evaluate(ticker, bars, now_ms, high)
-        if result and (not old or now_ms - int(old.get("checked_ms", 0)) > 7 * DAY):
+        needs_history = (result and result["stage"] == "reversal" and
+                         result["pump_pct"] >= SHORT_MIN_PUMP_PCT and
+                         result["retrace_pct"] <= SHORT_MAX_RETRACE_PCT and
+                         result["route_pct"] >= SHORT_MIN_ROUTE_PCT and
+                         result["risk_pct"] <= SHORT_MAX_RISK_PCT)
+        cache_age = DAY if high is None or high / ticker.price < SHORT_MIN_OLD_PEAK_MULTIPLE else 7 * DAY
+        if needs_history and (not old or now_ms - int(old.get("checked_ms", 0)) > cache_age):
             high = old_peak(client.bars(ticker.symbol, "1M", 100), now_ms)
+            if high is None or high / ticker.price < SHORT_MIN_OLD_PEAK_MULTIPLE:
+                daily = prior_daily_peak(client.bars(ticker.symbol, "1d", 365), now_ms)
+                high = max((value for value in (high, daily) if value is not None),
+                           default=None)
             update = (ticker.symbol, {"high": high, "checked_ms": now_ms})
             result = evaluate(ticker, bars, now_ms, high)
-        return result, evaluate_momentum(ticker, bars, now_ms), update
+        return result, evaluate_momentum(ticker, bars, now_ms) if include_momentum else None, update
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {pool.submit(inspect, ticker): ticker.symbol for ticker in selected}
