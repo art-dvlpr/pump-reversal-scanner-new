@@ -235,8 +235,12 @@ def old_peak(monthly: list[Bar], now_ms: int) -> float | None:
 
 
 def prior_daily_peak(daily: list[Bar], now_ms: int) -> float | None:
-    """Include young listings while excluding the current seven-day pump cycle."""
-    eligible = [bar.high for bar in daily if bar.start_ms < now_ms - 7 * DAY and bar.high > 0]
+    """Use completed older sessions, including recently listed crashed contracts.
+
+    A daily candle starting within the last two days can contain the ongoing
+    pump, so it cannot establish a prior peak for that same move.
+    """
+    eligible = [bar.high for bar in daily if bar.start_ms < now_ms - 2 * DAY and bar.high > 0]
     return max(eligible) if eligible else None
 
 

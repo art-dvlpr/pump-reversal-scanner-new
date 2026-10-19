@@ -82,6 +82,11 @@ def episode_for(signal: dict, episodes: dict, now_ms: int) -> dict:
 def should_send(signal: dict, episode: dict, now_ms: int) -> bool:
     if not signal.get("actionable"):
         return False
+    if signal["stage"] == "momentum_confirmed":
+        return (not episode.get("confirmed_sent", False) and
+                signal.get("price_trigger") is True and
+                (signal.get("oi_change_pct") or 0) >= 2 and
+                0 <= now_ms - signal["event_ms"] <= 20 * 60_000)
     if signal["stage"] != "reversal":
         return False
     return (not episode["reversal_sent"] and
@@ -115,6 +120,21 @@ def short_stop(stop: float, precision: int | None) -> float:
         return stop
     scale = 10 ** max(0, min(12, precision))
     return math.ceil(stop * scale) / scale
+
+
+def long_stop(stop: float, precision: int | None) -> float:
+    if precision is None:
+        return stop
+    scale = 10 ** max(0, min(12, precision))
+    return math.floor(stop * scale) / scale
+
+
+def long_target(entry: float, stop: float, precision: int | None) -> float:
+    raw = entry + 1.5 * (entry - stop)
+    if precision is None:
+        return raw
+    scale = 10 ** max(0, min(12, precision))
+    return math.ceil(raw * scale) / scale
 
 
 def local_time(utc_text: str) -> str:
@@ -152,8 +172,13 @@ def message(signal: dict, context: dict | None = None) -> str:
     lines.append("━━━━━━━━━━━━━━━━━━")
     entry, stop = signal["entry"], signal["stop"]
     if momentum:
-        raise ValueError("Long alerts are disabled")
-    lines.extend([f"🔹 <b>Условный вход:</b> около {price(entry)} USDT",
+        lines.extend([f"🔹 <b>Условный вход:</b> около {price(entry)} USDT",
+                      f"🎯 <b>Расчётная цель:</b> {price(signal['target1'])} USDT (1,5R)",
+                      f"🛑 <b>Отмена сценария:</b> {price(stop)} USDT",
+                      f"⚠️ До отмены: {signal['risk_pct']}% цены. "
+                      "Размер позиции и решение о входе — вручную."])
+    else:
+        lines.extend([f"🔹 <b>Условный вход:</b> около {price(entry)} USDT",
                   f"🎯 <b>Главная цель:</b> {price(signal['main_target'])} USDT "
                   f"(снижение цены от входа ≥{SHORT_MIN_ROUTE_PCT}%)",
                   f"📏 Основание пампа: {price(signal['pump_base'])} USDT · "
@@ -188,8 +213,10 @@ def message(signal: dict, context: dict | None = None) -> str:
 def select_alerts(signals: list[dict], state: dict, now_ms: int) -> list[dict]:
     episodes = state.setdefault("episodes", {})
     ready: list[dict] = []
-    eligible = [item for item in signals if item.get("actionable") and item["stage"] == "reversal"]
-    for signal in sorted(eligible, key=lambda item: -item.get("route_pct", 0)):
+    eligible = [item for item in signals if item.get("actionable") and
+                item["stage"] in ("reversal", "momentum_confirmed")]
+    for signal in sorted(eligible, key=lambda item: -item.get(
+            "route_pct", item.get("gain15_pct", 0))):
         episode = episode_for(signal, episodes, now_ms)
         if should_send(signal, episode, now_ms):
             ready.append(signal)
@@ -268,12 +295,14 @@ def refresh_entry(signal: dict, ticker, book: dict, now_ms: int) -> dict:
         if not (signal["price"] * 0.99 <= ticker.price <= signal["price"] * 1.01 and
                 ticker.price >= signal["breakout_level"]):
             raise ValueError("price left long entry zone")
-        risk = 100 * (1 - signal["stop"] / ticker.price)
+        stop = long_stop(signal["stop"], signal.get("price_precision"))
+        risk = 100 * (1 - stop / ticker.price)
         if not 0 < risk <= 7:
             raise ValueError("long stop distance no longer valid")
         latest["entry"] = ticker.price
+        latest["stop"] = stop
         latest["risk_pct"] = round(risk, 2)
-        latest["target1"] = ticker.price + 1.5 * (ticker.price - signal["stop"])
+        latest["target1"] = long_target(ticker.price, stop, signal.get("price_precision"))
     else:
         if not signal["entry"] * 0.98 <= ticker.price <= signal["entry"] * 1.01:
             raise ValueError("price left short entry zone")
@@ -318,7 +347,7 @@ def main() -> int:
     client = BingX()
     signals, coverage = scan_market(client, now_ms, state.get("history", {}),
                                     state.get("price_snapshots", {}),
-                                    state.get("oi_snapshots", {}), include_momentum=False)
+                                    state.get("oi_snapshots", {}), include_momentum=True)
     state.setdefault("history", {}).update(coverage.pop("history_updates"))
     state["price_snapshots"] = coverage.pop("price_updates")
     oi_updates = coverage.pop("oi_updates")

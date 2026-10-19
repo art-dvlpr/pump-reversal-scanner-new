@@ -106,7 +106,7 @@ class MonitorTests(unittest.TestCase):
 
     def test_young_listing_prior_peak_excludes_current_pump(self):
         day = 86_400_000
-        history = [Bar(self.now - 10 * day, 1, 8, 0.1, 0.2, 1),
+        history = [Bar(self.now - 5 * day, 1, 8, 0.1, 0.2, 1),
                    Bar(self.now - day, 0.2, 12, 0.1, 0.2, 1)]
         self.assertEqual(prior_daily_peak(history, self.now), 8)
 
@@ -122,7 +122,7 @@ class MonitorTests(unittest.TestCase):
         client.price_precisions = {ticker.symbol: 6}
         client.bars.side_effect = lambda _, interval, __: (
             bars if interval == "5m" else
-            [Bar(self.now - 10 * 86_400_000, 1, 2.16, 0.1, 0.2, 1)]
+            [Bar(self.now - 5 * 86_400_000, 1, 2.16, 0.1, 0.2, 1)]
             if interval == "1d" else [])
         signals, _ = scan_market(client, self.now, {}, include_momentum=False)
         self.assertEqual(len(signals), 1)
@@ -159,11 +159,12 @@ class MonitorTests(unittest.TestCase):
         long_watch = {"symbol": "VELVET-USDT", "stage": "momentum_watch",
                       "gain15_pct": 4, "oi_change_pct": None,
                       "event_ms": self.now - FIVE, "actionable": False}
-        long_entry = {**long_watch, "stage": "momentum_confirmed", "actionable": True}
+        long_entry = {**long_watch, "stage": "momentum_confirmed", "actionable": True,
+                      "price_trigger": True, "oi_change_pct": 3}
         state = {"episodes": {}}
         alerts = select_alerts([short, long_watch, long_entry], state, self.now)
-        self.assertEqual(alerts, [])
-        self.assertEqual(state["episodes"], {})
+        self.assertEqual(alerts, [long_entry])
+        mark_sent(long_entry, state)
         self.assertEqual(select_alerts([short, long_watch, long_entry], state, self.now), [])
 
     def test_local_state_survives_new_run(self):
@@ -206,8 +207,8 @@ class MonitorTests(unittest.TestCase):
                                   {"value": 100, "at_ms": self.now - FIVE}, self.now)
         self.assertEqual(seeded["stage"], "momentum_watch")
         self.assertTrue(confirmed["target1"] > confirmed["entry"] > confirmed["stop"])
-        with self.assertRaisesRegex(ValueError, "Long alerts are disabled"):
-            message(confirmed)
+        self.assertIn("#LONG", message(confirmed))
+        self.assertIn("1,5R", message(confirmed))
 
     def test_early_growth_seeds_oi_without_sending_entry(self):
         bars = [Bar(self.now - (40 - index) * FIVE, 1, 1.001, 0.999, 1, 100)
@@ -224,6 +225,32 @@ class MonitorTests(unittest.TestCase):
         confirmed = confirm_momentum(signal, 110,
                                      {"value": 100, "at_ms": self.now - FIVE}, self.now)
         self.assertEqual(select_alerts([confirmed], {"episodes": {}}, self.now), [])
+
+    def test_confirmed_long_has_fresh_rounded_entry_and_deduplicates(self):
+        signal = {"symbol": "TEST-USDT", "stage": "momentum_confirmed",
+                  "actionable": True, "price_trigger": True,
+                  "event_ms": self.now - FIVE, "gain15_pct": 4,
+                  "oi_change_pct": 3, "price": 1.025, "entry": 1.025,
+                  "stop": 0.98976, "breakout_level": 1.02,
+                  "price_precision": 3}
+        state = {"episodes": {}}
+        self.assertEqual(select_alerts([signal], state, self.now), [signal])
+        book = {"T": self.now, "bids": [["1.024", "10000"]],
+                "asks": [["1.026", "10000"]]}
+        ticker = Ticker("TEST-USDT", 1.025, 1.03, 0.99, 2_000_000,
+                        1.024, 1.026, self.now)
+        refreshed = refresh_entry(signal, ticker, book, self.now)
+        self.assertEqual(refreshed["stop"], 0.989)
+        self.assertGreaterEqual(refreshed["target1"],
+                                refreshed["entry"] + 1.5 *
+                                (refreshed["entry"] - refreshed["stop"]))
+        mark_sent(signal, state)
+        self.assertEqual(select_alerts([signal], state, self.now), [])
+        self.assertIn("#LONG", message({**refreshed, "observed_utc": "2027-01-15T08:00:00+00:00",
+                                         "last_closed_utc": "2027-01-15T08:00:00+00:00",
+                                         "gain60_pct": 8, "volume_ratio": 3,
+                                         "oi_window_min": 5, "turnover_usdt": 2_000_000,
+                                         "spread_pct": 0.2}))
 
     def test_watch_cannot_be_formatted_for_telegram(self):
         signal = evaluate(self.ticker, sample_bars(self.now), self.now, 2.16)
@@ -272,7 +299,7 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(confirmed.get("actionable", False))
         self.assertIsNone(confirmed["oi_change_pct"])
 
-    def test_main_keeps_long_disabled(self):
+    def test_main_scans_momentum_without_sending_unconfirmed_watch(self):
         now_ms = int(run_monitor.time.time() * 1000)
         signal = {"symbol": "TEST-USDT", "stage": "momentum_confirmed",
                   "actionable": True, "entry": 100, "stop": 95,
@@ -288,7 +315,7 @@ class MonitorTests(unittest.TestCase):
                     "oi_failures": 0}
         with (patch.object(run_monitor, "configured_store", return_value=store),
               patch.object(run_monitor, "BingX", return_value=client),
-              patch.object(run_monitor, "scan_market", return_value=([signal], coverage)),
+              patch.object(run_monitor, "scan_market", return_value=([signal], coverage)) as scan,
               patch.object(run_monitor, "select_alerts", return_value=[]),
               patch.object(run_monitor, "refresh_entry", return_value=signal),
               patch.object(run_monitor, "message", return_value="entry"),
@@ -298,8 +325,52 @@ class MonitorTests(unittest.TestCase):
               patch.object(run_monitor, "telegram_send", return_value=42) as send,
               patch.object(run_monitor.sys, "argv", ["run_monitor.py"])):
             self.assertEqual(run_monitor.main(), 0)
+        self.assertTrue(scan.call_args.kwargs["include_momentum"])
         send.assert_not_called()
         store.save.assert_called_once()
+
+    def test_main_sends_only_confirmed_long_entry(self):
+        now_ms = int(run_monitor.time.time() * 1000)
+        observed = run_monitor.utc(now_ms)
+        signal = {"symbol": "TEST-USDT", "stage": "momentum_confirmed",
+                  "actionable": True, "price_trigger": True,
+                  "event_ms": now_ms - FIVE, "price": 1.025,
+                  "entry": 1.025, "stop": 0.98976, "breakout_level": 1.02,
+                  "oi_baseline": 100, "oi_change_pct": 10,
+                  "oi_window_min": 5, "gain15_pct": 4, "gain60_pct": 8,
+                  "volume_ratio": 3, "risk_pct": 3.44,
+                  "turnover_usdt": 2_000_000, "spread_pct": 0.2,
+                  "price_precision": 3, "observed_utc": observed,
+                  "last_closed_utc": observed}
+        store = Mock()
+        store.load.return_value = {"version": 2, "history": {}, "episodes": {},
+                                   "price_snapshots": {}, "oi_snapshots": {}}
+        client = Mock()
+        client.context.return_value = {"open_interest": {
+            "time": now_ms, "openInterest": 110}}
+        client.ticker.return_value = Ticker("TEST-USDT", 1.025, 1.03, 0.99,
+                                            2_000_000, 1.024, 1.026, now_ms)
+        client.depth.return_value = {"T": now_ms,
+                                     "bids": [["1.024", "10000"]],
+                                     "asks": [["1.026", "10000"]]}
+        coverage = {"history_updates": {}, "price_updates": {}, "oi_updates": {},
+                    "deep_count": 1, "errors": [], "momentum_count": 1,
+                    "oi_failures": 0}
+        with (patch.object(run_monitor, "configured_store", return_value=store),
+              patch.object(run_monitor, "BingX", return_value=client),
+              patch.object(run_monitor, "scan_market", return_value=([signal], coverage)),
+              patch.object(run_monitor, "advance_evaluations", return_value={"pending": 1}),
+              patch.object(run_monitor, "prepare_milestone_report", return_value=None),
+              patch.object(run_monitor, "prepare_digest", return_value=None),
+              patch.object(run_monitor, "telegram_credentials", return_value=("token", "chat")),
+              patch.object(run_monitor, "telegram_send", return_value=42) as send,
+              patch.object(run_monitor.sys, "argv", ["run_monitor.py"])):
+            self.assertEqual(run_monitor.main(), 0)
+        send.assert_called_once()
+        self.assertIn("#LONG", send.call_args.args[2])
+        saved = store.save.call_args.args[0]
+        self.assertEqual(saved["evaluations"][0]["side"], "long")
+        self.assertTrue(saved["episodes"]["TEST-USDT#momentum"]["confirmed_sent"])
 
 
 if __name__ == "__main__":
